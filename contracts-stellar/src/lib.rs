@@ -10,6 +10,9 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
+/// Groth16 ZK-SNARK proof-of-access verifier (issue #70).
+mod zk_verifier;
+
 /// Zero-pads a `u64` into a 32-byte big-endian word, matching how Solidity's
 /// `abi.encodePacked` serializes a `uint256`.
 fn u256_be(value: u64) -> [u8; 32] {
@@ -224,6 +227,10 @@ pub enum DataKey {
     TokenUri(u64),
     OwnerBalance(Address),
     VaultTokenBalance(u64, Address),
+    // Groth16 ZK-SNARK proof-of-access nullifier registry (issue #70):
+    // spent nullifier hash => true. Prevents double-claiming a single
+    // beneficiary access proof.
+    ZkNullifier(BytesN<32>),
 }
 
 #[contract]
@@ -1949,6 +1956,211 @@ impl SpooVaultStellar {
             .persistent()
             .set(&key, &balance.saturating_sub(1));
         Self::bump_persistent(env, &key);
+    }
+
+    // -------------------------------------------------------------------
+    // Groth16 ZK-SNARK proof-of-access verification (issue #70)
+    //
+    // Allows a beneficiary to submit a zero-knowledge proof that they hold
+    // a valid vault key share, without revealing the secret share or their
+    // private identity on-chain.
+    //
+    // verify_access_proof: state-changing verification that marks the
+    //      nullifier as spent and returns success.
+    // verify_access_proof_view: view-only verification (pre-flight check).
+    // is_access_nullifier_spent: query whether a nullifier hash has been
+    //      consumed.
+    // -------------------------------------------------------------------
+
+    /// Verifies a Groth16 ZK-SNARK proof of access and records the nullifier.
+    /// Reverts if the proof is invalid or the nullifier was already spent.
+    ///
+    /// # Arguments
+    /// * `submitter` - The account submitting the proof (must authorize).
+    /// * `proof_a` - G1 point (64 bytes: X || Y).
+    /// * `proof_b` - G2 point (128 bytes: X_im || X_re || Y_im || Y_re).
+    /// * `proof_c` - G1 point (64 bytes).
+    /// * `vault_root_commitment` - Public signal: Poseidon(share, blinding).
+    /// * `nullifier_hash` - Public signal: Poseidon(privkey, document_id).
+    /// * `document_id` - Public signal.
+    /// * `vk_alpha` - Verifying key G1 point.
+    /// * `vk_beta` - Verifying key G2 point.
+    /// * `vk_gamma` - Verifying key G2 point.
+    /// * `vk_delta` - Verifying key G2 point.
+    /// * `vk_ic` - Array of IC G1 points (must have 4 entries for 3 inputs).
+    pub fn verify_access_proof(
+        env: Env,
+        submitter: Address,
+        proof_a: BytesN<64>,
+        proof_b: BytesN<128>,
+        proof_c: BytesN<64>,
+        vault_root_commitment: BytesN<32>,
+        nullifier_hash: BytesN<32>,
+        document_id: BytesN<32>,
+        vk_alpha: BytesN<64>,
+        vk_beta: BytesN<128>,
+        vk_gamma: BytesN<128>,
+        vk_delta: BytesN<128>,
+        vk_ic: Vec<BytesN<64>>,
+    ) {
+        submitter.require_auth();
+        Self::bump_instance(&env);
+
+        // Nullifier replay protection.
+        let nk = DataKey::ZkNullifier(nullifier_hash.clone());
+        let already_spent: bool = env.storage().persistent().get(&nk).unwrap_or(false);
+        assert!(!already_spent, "NullifierAlreadyUsed: this proof has already been consumed");
+
+        // Validate IC count.
+        assert!(vk_ic.len() == 4, "Invalid vk_ic length: expected 4 IC points for 3 public inputs");
+
+        // Reconstruct vk_x = IC[0] + commitment·IC[1] + nullifier·IC[2] + docId·IC[3]
+        let mut acc_x = vk_ic.get(0).unwrap();
+        let ic1 = vk_ic.get(1).unwrap();
+        let ic2 = vk_ic.get(2).unwrap();
+        let ic3 = vk_ic.get(3).unwrap();
+
+        acc_x = Self::bn254_g1_add(&env, &acc_x, &Self::bn254_g1_mul(&env, &ic1, &vault_root_commitment));
+        acc_x = Self::bn254_g1_add(&env, &acc_x, &Self::bn254_g1_mul(&env, &ic2, &nullifier_hash));
+        acc_x = Self::bn254_g1_add(&env, &acc_x, &Self::bn254_g1_mul(&env, &ic3, &document_id));
+
+        // Negate α on G1: −(x, y) = (x, P − y)
+        let neg_alpha = Self::negate_g1(&vk_alpha);
+
+        // Build pairing input: e(A, B) · e(−α, β) · e(vk_x, γ) · e(C, δ)
+        let mut input = Bytes::new(&env);
+        input.extend_from_array(&proof_a.to_array());
+        input.extend_from_array(&proof_b.to_array());
+        input.extend_from_array(&neg_alpha);
+        input.extend_from_array(&vk_beta.to_array());
+        input.extend_from_array(&acc_x);
+        input.extend_from_array(&vk_gamma.to_array());
+        input.extend_from_array(&proof_c.to_array());
+        input.extend_from_array(&vk_delta.to_array());
+
+        // Execute bn254 pairing check via Soroban host.
+        let pairing_ok = env
+            .crypto()
+            .bn254_pairing_check(&input)
+            .expect("InvalidProof: bn254 pairing check failed");
+        assert!(pairing_ok, "InvalidProof: pairing check returned false");
+
+        // Mark nullifier spent.
+        env.storage().persistent().set(&nk, &true);
+        Self::bump_persistent(&env, &nk);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "proof_verified"),
+                nullifier_hash.clone(),
+                document_id.clone(),
+            ),
+            submitter,
+        );
+    }
+
+    /// View-only proof verification (does not modify nullifier state).
+    pub fn verify_access_proof_view(
+        env: Env,
+        proof_a: BytesN<64>,
+        proof_b: BytesN<128>,
+        proof_c: BytesN<64>,
+        vault_root_commitment: BytesN<32>,
+        nullifier_hash: BytesN<32>,
+        document_id: BytesN<32>,
+        vk_alpha: BytesN<64>,
+        vk_beta: BytesN<128>,
+        vk_gamma: BytesN<128>,
+        vk_delta: BytesN<128>,
+        vk_ic: Vec<BytesN<64>>,
+    ) -> bool {
+        if vk_ic.len() != 4 {
+            return false;
+        }
+
+        let mut acc_x = vk_ic.get(0).unwrap();
+        let ic1 = vk_ic.get(1).unwrap();
+        let ic2 = vk_ic.get(2).unwrap();
+        let ic3 = vk_ic.get(3).unwrap();
+
+        acc_x = Self::bn254_g1_add(&env, &acc_x, &Self::bn254_g1_mul(&env, &ic1, &vault_root_commitment));
+        acc_x = Self::bn254_g1_add(&env, &acc_x, &Self::bn254_g1_mul(&env, &ic2, &nullifier_hash));
+        acc_x = Self::bn254_g1_add(&env, &acc_x, &Self::bn254_g1_mul(&env, &ic3, &document_id));
+
+        let neg_alpha = Self::negate_g1(&vk_alpha);
+
+        let mut input = Bytes::new(&env);
+        input.extend_from_array(&proof_a.to_array());
+        input.extend_from_array(&proof_b.to_array());
+        input.extend_from_array(&neg_alpha);
+        input.extend_from_array(&vk_beta.to_array());
+        input.extend_from_array(&acc_x);
+        input.extend_from_array(&vk_gamma.to_array());
+        input.extend_from_array(&proof_c.to_array());
+        input.extend_from_array(&vk_delta.to_array());
+
+        env.crypto()
+            .bn254_pairing_check(&input)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether a nullifier hash has already been consumed.
+    pub fn is_access_nullifier_spent(env: Env, nullifier_hash: BytesN<32>) -> bool {
+        let nk = DataKey::ZkNullifier(nullifier_hash);
+        let spent: bool = env.storage().persistent().get(&nk).unwrap_or(false);
+        if spent {
+            Self::bump_persistent(&env, &nk);
+        }
+        spent
+    }
+
+    /// G1 point addition via bn254 precompile.
+    fn bn254_g1_add(env: &Env, p1: &BytesN<64>, p2: &BytesN<64>) -> BytesN<64> {
+        let mut input = Bytes::new(env);
+        input.extend_from_array(&p1.to_array());
+        input.extend_from_array(&p2.to_array());
+        env.crypto().bn254_g1_add(&input).unwrap_or(*p1)
+    }
+
+    /// G1 scalar multiplication via bn254 precompile.
+    fn bn254_g1_mul(env: &Env, p: &BytesN<64>, scalar: &BytesN<32>) -> BytesN<64> {
+        let mut input = Bytes::new(env);
+        input.extend_from_array(&p.to_array());
+        input.extend_from_array(&scalar.to_array());
+        env.crypto().bn254_g1_mul(&input).unwrap_or(*p)
+    }
+
+    /// Negate a G1 point: −(x, y) = (x, P − y).
+    /// P = BN254 prime field modulus.
+    fn negate_g1(point: &BytesN<64>) -> BytesN<64> {
+        let arr = point.to_array();
+        let mut neg = arr;
+
+        // Negate y-coordinate (bytes 32..64) modulo BN254 field prime P.
+        // P = 0x30644e72e131a029b85045b68181585a97856a16c9d607f4d412cb0aecb60f30
+        // Overflow is not possible because y < P.
+        let p_bytes: [u8; 32] = [
+            0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29,
+            0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5a,
+            0x97, 0x85, 0x6a, 0x16, 0xc9, 0xd6, 0x07, 0xf4,
+            0xd4, 0x12, 0xcb, 0x0a, 0xec, 0xb6, 0x0f, 0x30,
+        ];
+
+        let mut borrow: u16 = 0;
+        for idx in (32..64).rev() {
+            let i = idx;
+            let p_byte = p_bytes[i - 32] as u16;
+            let y_byte = arr[i] as u16 + borrow;
+            if p_byte < y_byte {
+                neg[i] = (p_byte + 256 - y_byte) as u8;
+                borrow = 1;
+            } else {
+                neg[i] = (p_byte - y_byte) as u8;
+                borrow = 0;
+            }
+        }
+
+        BytesN::from_array(&env, &neg)
     }
 }
 
