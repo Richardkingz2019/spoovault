@@ -48,24 +48,40 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         POST_DEATH_ONLY
     }
 
+    // Field order below is chosen for storage-slot packing: adjacent fields
+    // that together fit in 32 bytes share a single slot. `creator`+`id`+
+    // `isActive` pack into slot 0, `approvalThreshold`+`createdAt` into one
+    // slot; `name`/`description`/`guardians` are dynamic and always take
+    // their own slot regardless of position. This is a pure storage-layout
+    // change - `getVault` (below) still returns the same
+    // (id, creator, name, description, guardians, approvalThreshold,
+    // isActive, createdAt) order and widens every narrowed field back to its
+    // original external type, so callers observe no ABI change.
     struct Vault {
-        uint256 id;
         address creator;
+        uint64 id;
+        bool isActive;
         string name;
         string description;
         address[] guardians;
-        uint256 approvalThreshold;
-        bool isActive;
-        uint256 createdAt;
+        uint96 approvalThreshold;
+        uint40 createdAt;
     }
 
+    // Field order is unchanged from before (this struct's field order is
+    // externally observable via the `documents` public-mapping getter), only
+    // widths are narrowed: `id`+`vaultId` pack into one slot, and
+    // `uploadedBy`+`uploadedAt`+`requiredAccess` (already adjacent) pack
+    // into another. ABI-encoded width per field is always 32 bytes
+    // regardless of the Solidity type's bit-width, so this is not a
+    // breaking change for callers.
     struct Document {
-        uint256 id;
-        uint256 vaultId;
+        uint64 id;
+        uint64 vaultId;
         string encryptedMetadata;
         string ipfsHash;
         address uploadedBy;
-        uint256 uploadedAt;
+        uint40 uploadedAt;
         AccessLevel requiredAccess;
     }
 
@@ -79,18 +95,24 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint256 createdAt;
     }
 
+    // Field order unchanged (externally observable via `getPendingInvites`,
+    // which returns this struct directly); `guardian`+`vaultId` pack into
+    // one slot and `accepted`+`expiresAt` (already adjacent) into another.
     struct GuardianInvite {
         address guardian;
-        uint256 vaultId;
+        uint64 vaultId;
         bool accepted;
-        uint256 expiresAt;
+        uint40 expiresAt;
     }
 
+    // Never returned as a raw struct externally (`getVaultReleaseState`
+    // manually rebuilds its own return tuple), so free to reorder: all four
+    // fields pack into a single slot.
     struct VaultReleaseState {
         bool emergencyMode;
-        uint256 inactivityPeriod;
-        uint256 lastProofOfLife;
-        uint256 lastProofOfLifeBlock;
+        uint40 inactivityPeriod;
+        uint40 lastProofOfLife;
+        uint40 lastProofOfLifeBlock;
     }
 
     struct KeeperAuthorization {
@@ -481,23 +503,10 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     function createVault(
         string memory name,
         string memory description,
-        address[] memory guardians,
+        address[] calldata guardians,
         uint256 approvalThreshold
     ) external nonReentrant returns (uint256) {
-        uint256 externalGuardianCount = 0;
-
-        for (uint256 i = 0; i < guardians.length; i++) {
-            address guardian = guardians[i];
-            if (guardian == address(0)) revert ZeroAddressGuardian();
-
-            for (uint256 j = 0; j < i; j++) {
-                if (guardians[j] == guardian) revert DuplicateGuardian();
-            }
-
-            if (guardian != msg.sender) {
-                externalGuardianCount++;
-            }
-        }
+        uint256 externalGuardianCount = _validateAndCountExternalGuardians(guardians, msg.sender);
 
         if (externalGuardianCount == 0) revert AtLeastOneGuardian();
 
@@ -510,19 +519,19 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint256 vaultId = _vaultIdCounter;
 
         Vault storage newVault = vaults[vaultId];
-        newVault.id = vaultId;
+        newVault.id = uint64(vaultId);
         newVault.creator = msg.sender;
         newVault.name = name;
         newVault.description = description;
-        newVault.approvalThreshold = approvalThreshold;
+        newVault.approvalThreshold = uint96(approvalThreshold);
         newVault.isActive = true;
-        newVault.createdAt = block.timestamp;
+        newVault.createdAt = uint40(block.timestamp);
 
         _vaultReleaseStates[vaultId] = VaultReleaseState({
             emergencyMode: false,
             inactivityPeriod: 30 days,
-            lastProofOfLife: block.timestamp,
-            lastProofOfLifeBlock: block.number
+            lastProofOfLife: uint40(block.timestamp),
+            lastProofOfLifeBlock: uint40(block.number)
         });
 
         newVault.guardians.push(msg.sender);
@@ -539,15 +548,70 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             }
             guardianInvites[guardian][vaultId] = GuardianInvite({
                 guardian: guardian,
-                vaultId: vaultId,
+                vaultId: uint64(vaultId),
                 accepted: false,
-                expiresAt: block.timestamp + 7 days
+                expiresAt: uint40(block.timestamp + 7 days)
             });
 
         }
 
         emit VaultCreated(vaultId, msg.sender, name);
         return vaultId;
+    }
+
+    /**
+     * @dev Validates a candidate guardian list (no zero address, no
+     *      duplicates) and returns the count of guardians distinct from
+     *      `sender`. The O(n^2) duplicate scan runs directly over calldata
+     *      in Yul, since Solidity's own bounds-checking on every
+     *      `guardians[j]` access is redundant here (`j < i < guardians.length`
+     *      is already an invariant of the loop). Reverts are still ordinary
+     *      Solidity custom errors decided from a status code the assembly
+     *      block computes, so the revert encoding itself is left entirely to
+     *      the compiler rather than hand-assembled here.
+     */
+    function _validateAndCountExternalGuardians(
+        address[] calldata guardians,
+        address sender
+    ) internal pure returns (uint256 externalCount) {
+        uint256 len = guardians.length;
+        uint256 failureCode;
+        assembly {
+            let base := guardians.offset
+            let extCount := 0
+            let code := 0
+            for { let i := 0 } lt(i, len) { i := add(i, 1) } {
+                let guardian := and(
+                    calldataload(add(base, mul(i, 0x20))),
+                    0xffffffffffffffffffffffffffffffffffffffff
+                )
+                if iszero(guardian) {
+                    code := 1
+                    break
+                }
+
+                for { let j := 0 } lt(j, i) { j := add(j, 1) } {
+                    let other := and(
+                        calldataload(add(base, mul(j, 0x20))),
+                        0xffffffffffffffffffffffffffffffffffffffff
+                    )
+                    if eq(other, guardian) {
+                        code := 2
+                        break
+                    }
+                }
+                if gt(code, 0) { break }
+
+                if iszero(eq(guardian, sender)) {
+                    extCount := add(extCount, 1)
+                }
+            }
+            externalCount := extCount
+            failureCode := code
+        }
+
+        if (failureCode == 1) revert ZeroAddressGuardian();
+        if (failureCode == 2) revert DuplicateGuardian();
     }
 
     /**
@@ -671,8 +735,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             revert InvalidInactivityPeriod();
         }
 
-        _vaultReleaseStates[vaultId].lastProofOfLife = block.timestamp;
-        _vaultReleaseStates[vaultId].inactivityPeriod = inactivityPeriod;
+        _vaultReleaseStates[vaultId].lastProofOfLife = uint40(block.timestamp);
+        _vaultReleaseStates[vaultId].inactivityPeriod = uint40(inactivityPeriod);
         emit VaultReleaseConfigured(vaultId, inactivityPeriod);
     }
 
@@ -753,8 +817,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      *      the keeper-relayed path.
      */
     function _recordProofOfLife(uint256 vaultId) internal {
-        _vaultReleaseStates[vaultId].lastProofOfLife = block.timestamp;
-        _vaultReleaseStates[vaultId].lastProofOfLifeBlock = block.number;
+        _vaultReleaseStates[vaultId].lastProofOfLife = uint40(block.timestamp);
+        _vaultReleaseStates[vaultId].lastProofOfLifeBlock = uint40(block.number);
         emit ProofOfLifeRecorded(vaultId, vaults[vaultId].creator, block.timestamp, getVaultGID(vaultId));
     }
 
@@ -1118,7 +1182,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
                 revert InvalidNewThreshold();
             }
 
-            vault.approvalThreshold = newThreshold;
+            vault.approvalThreshold = uint96(newThreshold);
             thresholdProposal.executed = true;
         }
 
@@ -1323,12 +1387,12 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint256 documentId = _documentIdCounter;
 
         documents[documentId] = Document({
-            id: documentId,
-            vaultId: vaultId,
+            id: uint64(documentId),
+            vaultId: uint64(vaultId),
             encryptedMetadata: encryptedMetadata,
             ipfsHash: ipfsHash,
             uploadedBy: msg.sender,
-            uploadedAt: block.timestamp,
+            uploadedAt: uint40(block.timestamp),
             requiredAccess: requiredAccess
         });
 
