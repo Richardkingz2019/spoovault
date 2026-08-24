@@ -9,6 +9,7 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./ISpooVault.sol";
 import "./IERC6551Registry.sol";
 import "./interfaces/IVRFCoordinatorV2Plus.sol";
+import "./libs/FHEEngine.sol";
 
 /**
  * @title SpooVault
@@ -206,6 +207,16 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     // requestId => guardianAddress => encryptedShareForBeneficiary
     mapping(uint256 => mapping(address => string)) public beneficiaryKeyShares;
 
+    // FHE-encrypted shares and accumulator mappings
+    // documentId => guardianAddress => fheCiphertext
+    mapping(uint256 => mapping(address => bytes)) public fheGuardianShares;
+    // requestId => guardianAddress => fheCiphertextForBeneficiary
+    mapping(uint256 => mapping(address => bytes)) public fheBeneficiaryShares;
+    // requestId => aggregated FHE ciphertext payload
+    mapping(uint256 => bytes) public fheRequestAccumulator;
+    // requestId => count of aggregated FHE shares
+    mapping(uint256 => uint256) public fheAccumulatorCount;
+
     // Compromised key rotation and revocation registry (issue #156)
     // keccak256(publicKey) => revoked flag; blacklisted keys can never be re-registered
     mapping(bytes32 => bool) private _revokedKeyHashes;
@@ -335,6 +346,9 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     event KeyRevoked(address indexed user, string oldPublicKey, string newPublicKey, uint256 rotationCount);
     event GuardianSharesSaved(uint256 indexed documentId);
     event ShareSubmittedForBeneficiary(uint256 indexed requestId, address indexed guardian, string encryptedShare);
+    event FheGuardianSharesSaved(uint256 indexed documentId, uint256 count);
+    event FheShareSubmitted(uint256 indexed requestId, address indexed guardian);
+    event FheSharesAggregated(uint256 indexed requestId, uint256 indexed documentId, address indexed requester, bytes aggregateCiphertext);
     event GuardianRemovalProposed(uint256 indexed vaultId, address indexed guardian, address indexed proposedBy);
     event GuardianRemovalApproved(uint256 indexed vaultId, address indexed guardian, address indexed approver);
     event ThresholdUpdateProposed(uint256 indexed vaultId, uint256 newThreshold, address indexed proposedBy);
@@ -405,6 +419,29 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /// @return The encrypted share string.
     function getBeneficiaryKeyShare(uint256 requestId, address guardian) external view returns (string memory) {
         return beneficiaryKeyShares[requestId][guardian];
+    }
+
+    /// @notice Returns the on-chain aggregated FHE ciphertext for an access request.
+    /// @param requestId The identifier of the access request.
+    /// @return The aggregate FHE ciphertext bytes.
+    function getFheAggregate(uint256 requestId) external view returns (bytes memory) {
+        return fheRequestAccumulator[requestId];
+    }
+
+    /// @notice Returns the FHE-encrypted share stored for a document/guardian pair.
+    /// @param documentId The identifier of the document.
+    /// @param guardian The guardian address whose share is requested.
+    /// @return The FHE encrypted share bytes.
+    function getFheGuardianShare(uint256 documentId, address guardian) external view returns (bytes memory) {
+        return fheGuardianShares[documentId][guardian];
+    }
+
+    /// @notice Returns the FHE-encrypted share submitted by a guardian for an access request.
+    /// @param requestId The identifier of the access request.
+    /// @param guardian The guardian address whose share is requested.
+    /// @return The FHE encrypted share bytes.
+    function getFheBeneficiaryShare(uint256 requestId, address guardian) external view returns (bytes memory) {
+        return fheBeneficiaryShares[requestId][guardian];
     }
 
     constructor() ERC721("SpooVault Access Token", "SPVT") EIP712("SpooVault", "1") {
@@ -1352,6 +1389,27 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     }
 
     /**
+     * @dev Save FHE-encrypted guardian shares for a document.
+     */
+    function saveGuardianSharesFHE(
+        uint256 documentId,
+        address[] calldata guardiansList,
+        bytes[] calldata sharesFHE
+    ) external nonReentrant {
+        if (documents[documentId].id == 0) revert DocumentNotExist();
+        uint256 vaultId = documents[documentId].vaultId;
+        if (vaults[vaultId].creator != msg.sender && !isGuardian[vaultId][msg.sender]) {
+            revert OnlyGuardian();
+        }
+        if (guardiansList.length != sharesFHE.length) revert InvalidShareRefreshInput();
+
+        for (uint256 i = 0; i < guardiansList.length; i++) {
+            fheGuardianShares[documentId][guardiansList[i]] = sharesFHE[i];
+        }
+        emit FheGuardianSharesSaved(documentId, guardiansList.length);
+    }
+
+    /**
      * @dev Approve an access request (accepted guardian only, never the requester).
      */
     function approveAccess(uint256 requestId) external nonReentrant {
@@ -1365,6 +1423,56 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      */
     function approveAccess(uint256 requestId, string calldata encryptedShareForBeneficiary) external nonReentrant {
         _approveAccess(requestId, encryptedShareForBeneficiary);
+    }
+
+    /**
+     * @dev Approve an access request using an FHE-encrypted share payload.
+     *      Homomorphically accumulates the share directly on-chain without decrypting.
+     */
+    function approveAccessFHE(uint256 requestId, bytes calldata fheSharePayload) external nonReentrant {
+        AccessRequest storage request = accessRequests[requestId];
+        if (request.requestId == 0) revert RequestNotExist();
+        if (request.status != RequestStatus.PENDING) revert RequestNotPending();
+        if (request.expiresAt <= block.timestamp) revert RequestExpired();
+        if (request.requester == msg.sender) revert CannotSelfApproveAccess();
+
+        uint256 vaultId = documents[request.documentId].vaultId;
+        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
+        if (hasApprovedRequest[requestId][msg.sender]) revert AlreadyApproved();
+
+        bytes memory guardianKey = bytes(userPublicKeys[msg.sender]);
+        if (guardianKey.length != 0 && _revokedKeyHashes[keccak256(guardianKey)]) {
+            revert RevokedPublicKey();
+        }
+
+        hasApprovedRequest[requestId][msg.sender] = true;
+        request.approvedBy.push(msg.sender);
+
+        if (fheSharePayload.length > 0) {
+            fheBeneficiaryShares[requestId][msg.sender] = fheSharePayload;
+            bytes memory currentAcc = fheRequestAccumulator[requestId];
+            fheRequestAccumulator[requestId] = FHEEngine.fheAdd(currentAcc, fheSharePayload);
+            fheAccumulatorCount[requestId] += 1;
+            emit FheShareSubmitted(requestId, msg.sender);
+        }
+
+        emit AccessApproved(requestId, msg.sender);
+
+        if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
+            if (!_ownsVaultToken(request.requester, vaultId)) {
+                request.status = RequestStatus.REJECTED;
+                return;
+            }
+
+            request.status = RequestStatus.APPROVED;
+            _grantAccess(requestId, request.documentId, request.requester);
+            emit FheSharesAggregated(
+                requestId,
+                request.documentId,
+                request.requester,
+                fheRequestAccumulator[requestId]
+            );
+        }
     }
 
     function _approveAccess(uint256 requestId, string memory encryptedShareForBeneficiary) internal {

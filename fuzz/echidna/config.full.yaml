@@ -1,0 +1,24 @@
+testMode: property
+# Full campaign target for issue #150's acceptance criteria: 100,000 runs
+# with 0 property invariant violations. Too slow to run on every push/PR
+# (see config.yaml for the bounded smoke config used there), so this is
+# wired to the scheduled/workflow_dispatch "full" job in fuzzing.yml only.
+testLimit: 100000
+seqLen: 100
+corpusDir: "/tmp/echidna-corpus-full"
+coverage: false
+codeSize: 0xffffff
+# Echidna will only attempt to break `echidna_*` properties.
+format: text
+# Stop early if a property is violated.
+stopOnFail: true
+# A 100,000-run campaign needs much more wall-clock time than the smoke
+# config's 300s budget.
+timeout: 10800
+cryticArgs:
+  - "--solc"
+  - "/src/solc-static-linux"
+  - "--solc-remaps"
+  - "@openzeppelin/=/src/node_modules/@openzeppelin/"
+  - "--solc-args"
+  - "--optimize --optimize-runs 200 --evm-version cancun"

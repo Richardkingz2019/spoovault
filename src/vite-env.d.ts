@@ -25,6 +25,11 @@ interface ImportMetaEnv {
   readonly VITE_PIR_DUMMY_COUNT?: string;
   readonly VITE_PIR_BATCH_DELAY?: string;
   readonly VITE_SOROBAN_EVENT_RELAY_URL?: string;
+  readonly VITE_LIGHTHOUSE_API_KEY?: string;
+  readonly VITE_LIGHTHOUSE_GATEWAY_URL?: string;
+  readonly VITE_ARWEAVE_NODE_URL?: string;
+  readonly VITE_ARWEAVE_GATEWAY_URL?: string;
+  readonly VITE_BACKUP_STORAGE_PROVIDERS?: string;
 }
 
 interface ImportMeta {

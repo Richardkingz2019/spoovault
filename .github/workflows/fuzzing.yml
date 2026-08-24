@@ -5,6 +5,17 @@ on:
     branches: [main, master, dev]
   pull_request:
     branches: [main, master, dev]
+  # Nightly full campaigns: Echidna/Medusa at their 100,000-run target and
+  # cargo-fuzz at its 1,000,000-iteration target (see docs/TESTING.md). Every
+  # push/PR instead runs a bounded smoke campaign so CI stays fast.
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      full_campaign:
+        description: "Run the full campaign sizes (100k Echidna/Medusa runs, 1M cargo-fuzz iterations) instead of the CI smoke sizes"
+        type: boolean
+        default: false
 
 concurrency:
   group: fuzzing-${{ github.ref }}
@@ -33,6 +44,15 @@ jobs:
           curl -sL -o solc-static-linux "https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux"
           chmod +x solc-static-linux
 
+      - name: Pick campaign config
+        id: config
+        run: |
+          if [ "${{ github.event_name == 'schedule' || inputs.full_campaign == true }}" = "true" ]; then
+            echo "path=/src/fuzz/echidna/config.full.yaml" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=/src/fuzz/echidna/config.yaml" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Echidna campaign
         run: |
           docker run --rm \
@@ -41,7 +61,7 @@ jobs:
             trailofbits/echidna:v2.2.3 \
             /src/fuzz/harness/SpooVaultFuzz.sol \
             --contract SpooVaultFuzz \
-            --config /src/fuzz/echidna/config.yaml \
+            --config ${{ steps.config.outputs.path }} \
             --test-mode property
 
   medusa:
@@ -86,10 +106,19 @@ jobs:
           solc-select install 0.8.24
           solc-select use 0.8.24
 
+      - name: Pick campaign config
+        id: config
+        run: |
+          if [ "${{ github.event_name == 'schedule' || inputs.full_campaign == true }}" = "true" ]; then
+            echo "file=medusa.full.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=medusa.json" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Medusa campaign
         run: |
           export PATH="$HOME/go/bin:$PATH"
-          cd fuzz/medusa && medusa fuzz --config medusa.json
+          cd fuzz/medusa && medusa fuzz --config ${{ steps.config.outputs.file }}
 
   soroban-fuzz:
     name: Soroban proptest (cargo-fuzz / proptest)
@@ -104,6 +133,12 @@ jobs:
           components: rustfmt
           targets: wasm32-unknown-unknown
 
+      - name: Setup Rust nightly (cargo-fuzz)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+          targets: wasm32-unknown-unknown
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -112,19 +147,42 @@ jobs:
             ~/.cargo/git
             contracts-stellar/target
             contracts-stellar/upgrade_fixture/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts-stellar/Cargo.lock', 'contracts-stellar/upgrade_fixture/Cargo.toml') }}
+            contracts-stellar/fuzz/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts-stellar/Cargo.lock', 'contracts-stellar/upgrade_fixture/Cargo.toml', 'contracts-stellar/fuzz/Cargo.toml') }}
 
       # The upgrade_contract integration test imports this fixture's
       # compiled Wasm at compile time via `contractimport!`, so it must
       # exist before `cargo test` on the main crate below.
       - name: Build upgrade_fixture Wasm
         working-directory: contracts-stellar/upgrade_fixture
-        run: cargo build --release --target wasm32-unknown-unknown
+        run: cargo +stable build --release --target wasm32-unknown-unknown
 
       - name: Format (Soroban crate)
         working-directory: contracts-stellar
-        run: cargo fmt
+        run: cargo +stable fmt
 
+      # Runs the deterministic scenarios in src/test.rs and the
+      # property-based random state-sequence fuzzing in src/fuzz_test.rs
+      # (256 generated sequences per run; see docs/TESTING.md).
       - name: Run Soroban contract test suite
         working-directory: contracts-stellar
-        run: cargo test
+        run: cargo +stable test
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Pick cargo-fuzz campaign size
+        id: config
+        run: |
+          if [ "${{ github.event_name == 'schedule' || inputs.full_campaign == true }}" = "true" ]; then
+            echo "runs=1000000" >> "$GITHUB_OUTPUT"
+          else
+            echo "runs=20000" >> "$GITHUB_OUTPUT"
+          fi
+
+      # cargo-fuzz's target/corpus/artifacts live under contracts-stellar/fuzz
+      # and are gitignored; -runs bounds the campaign to a fixed iteration
+      # count instead of running until manually stopped.
+      - name: Run cargo-fuzz campaign
+        working-directory: contracts-stellar/fuzz
+        run: cargo +nightly fuzz run state_machine -- -runs=${{ steps.config.outputs.runs }}

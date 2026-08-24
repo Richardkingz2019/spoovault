@@ -82,6 +82,10 @@ CI runs [Slither](https://github.com/crytic/slither) and [Mythril](https://githu
   ```
   Opens an HTML report at `coverage/tarpaulin-report.html`. CI runs this on every push/PR (see [`coverage.yml`](.github/workflows/coverage.yml)) and uploads the XML/HTML reports as the `soroban-coverage-report` workflow artifact. SpooVault's PR policy targets >=90% line/branch coverage on new or modified contract code.
 
+### 4. Fuzzing & Property Testing (EVM + Stellar)
+
+Echidna/Medusa property fuzzing of `SpooVault.sol` (`fuzz/`) and proptest/cargo-fuzz random state-sequence fuzzing of the Soroban contract (`contracts-stellar/src/fuzz_test.rs`, `contracts-stellar/fuzz/`) run in CI (see [`fuzzing.yml`](.github/workflows/fuzzing.yml)). See [docs/TESTING.md](./docs/TESTING.md) for the full property list, campaign sizes, and how to run each fuzzer locally.
+
 ---
 
 ## Developing the Frontend

@@ -35,7 +35,6 @@ import {
 import {
   decryptData,
   encryptData,
-  fetchFromIPFS,
   generateEncryptionKey,
   isIPFSConfigured,
   shortenAddress,
@@ -59,6 +58,7 @@ import {
   encryptAndUploadFile,
   importStreamingKey,
 } from "../services/streamingCrypto.service";
+import { storageProviderService } from "../services/storageProvider.service";
 
 type WordArray = { words: number[]; sigBytes: number };
 type ImportedKeyPayload = {
@@ -752,6 +752,30 @@ const Documents = () => {
         signal: abortController.signal,
       });
 
+      // Replicate the encrypted payload to permanent backup providers
+      // (Filecoin/Arweave) in the background — never blocks or fails the upload.
+      storageProviderService
+        .backupDocument({
+          ipfsHash: ipfsResult.hash,
+          plaintext: selectedFile,
+          keyHex: key,
+          filename: `${selectedFile.name}.svsc`,
+          signal: abortController.signal,
+        })
+        .then((report) => {
+          report.failures.forEach((failure) =>
+            captureError("documents.backupReplication", failure.error, {
+              provider: failure.provider,
+              documentHash: ipfsResult.hash,
+            })
+          );
+        })
+        .catch((error) =>
+          captureError("documents.backupReplication", error, {
+            documentHash: ipfsResult.hash,
+          })
+        );
+
       setUploadStage("submitting_tx");
       const documentId = await contractService.addDocument(
         selectedVaultId,
@@ -815,7 +839,8 @@ const Documents = () => {
       throw new Error("Encryption key not found for this document");
     }
 
-    const response = await fetchFromIPFS(doc.ipfsHash);
+    // Multi-provider fetch: IPFS gateway pool first, then Filecoin/Arweave backups.
+    const response = await storageProviderService.fetchDocument(doc.ipfsHash);
 
     const { isStreaming, stream } = await detectStreamingCiphertext(response.body as any);
     const metadata = decryptMetadata(doc);

@@ -35,7 +35,6 @@ import {
 import { buttonClasses } from "../utils/buttonClasses";
 import {
   decryptData,
-  fetchFromIPFS,
   formatDate,
   isValidAddress,
   shortenAddress,
@@ -53,6 +52,7 @@ import {
   detectStreamingCiphertext,
   importStreamingKey,
 } from "../services/streamingCrypto.service";
+import { storageProviderService } from "../services/storageProvider.service";
 // reconstructSecret is available for on-chain SSS share reconstruction when needed
 // import { reconstructSecret } from "../services/secrets.service";
 
@@ -697,7 +697,8 @@ const AccessCenter = () => {
       );
     }
 
-    const response = await fetchFromIPFS(doc.ipfsHash);
+    // Multi-provider fetch: IPFS gateway pool first, then Filecoin/Arweave backups.
+    const response = await storageProviderService.fetchDocument(doc.ipfsHash);
     if (!response.body) {
       throw new Error("Empty response received from IPFS");
     }

@@ -3,6 +3,7 @@ import {
   keyRotationService,
   KeyOwnershipProofError,
   ShareEnvelopeRef,
+  VaultEnvelopeBatch,
 } from "../services/keyRotation.service";
 import { clientKeyringService } from "../services/clientKeyring.service";
 import {
@@ -36,6 +37,10 @@ describe("KeyRotationService (Automated Compromise Key Rotation)", { timeout: 60
       }))
     );
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Full rotation lifecycle
+  // ─────────────────────────────────────────────────────────────────────────
 
   describe("Full rotation lifecycle", () => {
     it("should re-encrypt all envelopes to the new key and call revokeKey on-chain", async () => {
@@ -111,6 +116,266 @@ describe("KeyRotationService (Automated Compromise Key Rotation)", { timeout: 60
     });
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Soroban (Stellar) contract adapter
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("Soroban contract adapter", () => {
+    it("calls revokeKey on both EVM and Soroban contracts when both are supplied", async () => {
+      const evmCalls: Array<[string, string]> = [];
+      const sorobanCalls: Array<[string, string, string]> = [];
+
+      const contract = {
+        revokeKey: async (old: string, next: string) => {
+          evmCalls.push([old, next]);
+          return { hash: "0xevm-tx", wait: async () => ({ status: 1 }) };
+        },
+      };
+      const sorobanContract = {
+        revokeKey: async (user: string, old: string, next: string) => {
+          sorobanCalls.push([user, old, next]);
+          return { hash: "soroban-tx-abc" };
+        },
+      };
+
+      const report = await keyRotationService.rotateCompromisedKey({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        envelopes,
+        contract,
+        sorobanContract,
+      });
+
+      // Both adapters invoked once.
+      expect(evmCalls).toHaveLength(1);
+      expect(sorobanCalls).toHaveLength(1);
+
+      // Soroban receives (user, oldKey, newKey) — user is the account.
+      expect(sorobanCalls[0][0]).toBe(testAccount);
+      expect(sorobanCalls[0][1]).toBe(oldKeys.publicKey);
+      expect(sorobanCalls[0][2]).toBe(report.newPublicKey);
+
+      // Both hashes are returned in the report.
+      expect(report.transactionHash).toBe("0xevm-tx");
+      expect(report.sorobanTxHash).toBe("soroban-tx-abc");
+    });
+
+    it("returns only the Soroban hash when only the Soroban adapter is supplied", async () => {
+      const sorobanContract = {
+        revokeKey: async (_user: string, _old: string, _next: string) =>
+          ({ id: "stellar-op-id-xyz" }),
+      };
+
+      const report = await keyRotationService.rotateCompromisedKey({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        envelopes: [envelopes[0]],
+        sorobanContract,
+      });
+
+      expect(report.transactionHash).toBeUndefined();
+      expect(report.sorobanTxHash).toBe("stellar-op-id-xyz");
+    });
+
+    it("does not call Soroban when only the EVM contract is supplied", async () => {
+      const sorobanCalls: string[] = [];
+      const contract = {
+        revokeKey: async () => ({ hash: "0xevm-only", wait: async () => ({}) }),
+      };
+
+      // No sorobanContract arg — sorobanCalls must stay empty.
+      const report = await keyRotationService.rotateCompromisedKey({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        envelopes: [envelopes[0]],
+        contract,
+      });
+
+      expect(sorobanCalls).toHaveLength(0);
+      expect(report.sorobanTxHash).toBeUndefined();
+      expect(report.transactionHash).toBe("0xevm-only");
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Emergency batch revocation
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("Emergency batch revocation", () => {
+    let vault1Envelopes: ShareEnvelopeRef[];
+    let vault2Envelopes: ShareEnvelopeRef[];
+    let vaultBatches: VaultEnvelopeBatch[];
+
+    beforeEach(async () => {
+      const vault1Secrets = [
+        { documentId: 10, plaintext: "vault-1-doc-10" },
+        { documentId: 11, plaintext: "vault-1-doc-11" },
+      ];
+      const vault2Secrets = [
+        { documentId: 20, plaintext: "vault-2-doc-20" },
+        { documentId: 21, plaintext: "vault-2-doc-21" },
+        { documentId: 22, plaintext: "vault-2-doc-22" },
+      ];
+
+      vault1Envelopes = await Promise.all(
+        vault1Secrets.map(async ({ documentId, plaintext }) => ({
+          documentId,
+          envelope: await encryptWithPublicKey(plaintext, oldKeys.publicKey),
+        }))
+      );
+      vault2Envelopes = await Promise.all(
+        vault2Secrets.map(async ({ documentId, plaintext }) => ({
+          documentId,
+          envelope: await encryptWithPublicKey(plaintext, oldKeys.publicKey),
+        }))
+      );
+
+      vaultBatches = [
+        { vaultId: 1, envelopes: vault1Envelopes },
+        { vaultId: 2, envelopes: vault2Envelopes },
+      ];
+    });
+
+    it("re-encrypts envelopes across all vaults with a single on-chain revocation", async () => {
+      const revokeCalls: number[] = [];
+      const contract = {
+        revokeKey: async () => {
+          revokeCalls.push(1);
+          return { hash: "0xbatch-tx", wait: async () => ({ status: 1 }) };
+        },
+      };
+
+      const report = await keyRotationService.emergencyBatchRevoke({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        vaultBatches,
+        contract,
+      });
+
+      // On-chain call made exactly once.
+      expect(revokeCalls).toHaveLength(1);
+
+      expect(report.totalDocumentsRotated).toBe(5);
+      expect(report.totalFailures).toBe(0);
+      expect(report.vaultResults).toHaveLength(2);
+      expect(report.vaultResults[0].vaultId).toBe(1);
+      expect(report.vaultResults[0].rotatedDocumentIds.sort()).toEqual([10, 11]);
+      expect(report.vaultResults[1].vaultId).toBe(2);
+      expect(report.vaultResults[1].rotatedDocumentIds.sort()).toEqual([20, 21, 22]);
+      expect(report.transactionHash).toBe("0xbatch-tx");
+    });
+
+    it("invokes both EVM and Soroban adapters exactly once during batch revocation", async () => {
+      let evmCalled = 0;
+      let sorobanCalled = 0;
+
+      const contract = {
+        revokeKey: async () => {
+          evmCalled++;
+          return { hash: "0xevm-batch", wait: async () => ({}) };
+        },
+      };
+      const sorobanContract = {
+        revokeKey: async () => {
+          sorobanCalled++;
+          return { hash: "soroban-batch" };
+        },
+      };
+
+      const report = await keyRotationService.emergencyBatchRevoke({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        vaultBatches,
+        contract,
+        sorobanContract,
+      });
+
+      expect(evmCalled).toBe(1);
+      expect(sorobanCalled).toBe(1);
+      expect(report.sorobanTxHash).toBe("soroban-batch");
+    });
+
+    it("isolates per-vault failures without aborting other vaults", async () => {
+      const corruptedBatches: VaultEnvelopeBatch[] = [
+        {
+          vaultId: 1,
+          envelopes: [
+            vault1Envelopes[0],
+            { documentId: 999, envelope: "{ not-valid-json }" },
+          ],
+        },
+        { vaultId: 2, envelopes: vault2Envelopes },
+      ];
+
+      const report = await keyRotationService.emergencyBatchRevoke({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        vaultBatches: corruptedBatches,
+      });
+
+      // Vault 1 succeeds partially.
+      const v1 = report.vaultResults.find((r) => r.vaultId === 1)!;
+      expect(v1.rotatedDocumentIds).toContain(vault1Envelopes[0].documentId);
+      expect(v1.failures).toHaveLength(1);
+      expect(v1.failures[0].documentId).toBe(999);
+
+      // Vault 2 succeeds completely.
+      const v2 = report.vaultResults.find((r) => r.vaultId === 2)!;
+      expect(v2.failures).toHaveLength(0);
+      expect(v2.rotatedDocumentIds).toHaveLength(vault2Envelopes.length);
+
+      expect(report.totalFailures).toBe(1);
+    });
+
+    it("rejects when the private key cannot prove possession across any vault", async () => {
+      const wrongKeys = await generateECIESKeyPairBase64();
+
+      await expect(
+        keyRotationService.emergencyBatchRevoke({
+          account: testAccount,
+          oldPublicKey: oldKeys.publicKey,
+          oldPrivateKey: wrongKeys.privateKey,
+          vaultBatches,
+        })
+      ).rejects.toBeInstanceOf(KeyOwnershipProofError);
+    });
+
+    it("persists the new keypair after batch revocation", async () => {
+      const report = await keyRotationService.emergencyBatchRevoke({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        vaultBatches: [{ vaultId: 1, envelopes: [vault1Envelopes[0]] }],
+      });
+
+      const stored = await clientKeyringService.getStoredPublicKey(testAccount);
+      expect(stored).toBe(report.newPublicKey);
+    });
+
+    it("handles an empty vault batch list gracefully", async () => {
+      const report = await keyRotationService.emergencyBatchRevoke({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        vaultBatches: [],
+      });
+
+      expect(report.totalDocumentsRotated).toBe(0);
+      expect(report.totalFailures).toBe(0);
+      expect(report.vaultResults).toHaveLength(0);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Proof of possession & failure handling
+  // ─────────────────────────────────────────────────────────────────────────
+
   describe("Proof of possession & failure handling", () => {
     it("should refuse rotation when the private key cannot decrypt the envelopes", async () => {
       const wrongKeys = await generateECIESKeyPairBase64();
@@ -176,7 +441,55 @@ describe("KeyRotationService (Automated Compromise Key Rotation)", { timeout: 60
       });
 
       expect(report.transactionHash).toBeUndefined();
+      expect(report.sorobanTxHash).toBeUndefined();
       expect(report.rotatedDocumentIds).toEqual([envelopes[0].documentId]);
+    });
+
+    it("accepts a pre-generated replacement keypair", async () => {
+      const generated = await generateECIESKeyPairBase64();
+
+      const report = await keyRotationService.rotateCompromisedKey({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        newPublicKey: generated.publicKey,
+        newPrivateKey: generated.privateKey,
+        envelopes: [envelopes[0]],
+      });
+
+      expect(report.newPublicKey).toBe(generated.publicKey);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Report shape & metadata
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("Report shape & metadata", () => {
+    it("normalises the account address to lowercase in the report", async () => {
+      const upperAccount = testAccount.toUpperCase();
+      const report = await keyRotationService.rotateCompromisedKey({
+        account: upperAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        envelopes: [envelopes[0]],
+      });
+
+      expect(report.account).toBe(upperAccount.toLowerCase());
+    });
+
+    it("records a timestamp in the report", async () => {
+      const before = Date.now();
+      const report = await keyRotationService.rotateCompromisedKey({
+        account: testAccount,
+        oldPublicKey: oldKeys.publicKey,
+        oldPrivateKey: oldKeys.privateKey,
+        envelopes: [envelopes[0]],
+      });
+      const after = Date.now();
+
+      expect(report.rotatedAt).toBeGreaterThanOrEqual(before);
+      expect(report.rotatedAt).toBeLessThanOrEqual(after);
     });
   });
 });

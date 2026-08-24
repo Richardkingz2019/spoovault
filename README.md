@@ -93,6 +93,7 @@ npm run dev
 - **Stellar Soroban Tests**: `npm run test:stellar`
 - **TypeScript Verification**: `npx tsc --noEmit`
 - **Production Bundle Check**: `npx vite build` emits named `vendor-react`, `vendor-heroui`, `vendor-ethers`, and lazy `vendor-stellar` chunks so the entry JavaScript bundle stays below the initial-load budget.
+- **Fuzzing & Property Testing**: Echidna/Medusa property fuzzing of `SpooVault.sol` and proptest/cargo-fuzz random state-sequence fuzzing of the Soroban contract — see [docs/TESTING.md](docs/TESTING.md).
 
 ---
 

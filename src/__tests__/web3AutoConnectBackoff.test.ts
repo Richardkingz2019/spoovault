@@ -3,6 +3,33 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import React from "react";
 import { renderHook, act } from "@testing-library/react";
 
+// In-memory localStorage shim for Vitest environment
+class MockLocalStorage {
+  private store: Record<string, string> = {};
+  getItem(key: string): string | null {
+    return this.store[key] ?? null;
+  }
+  setItem(key: string, value: string): void {
+    this.store[key] = String(value);
+  }
+  removeItem(key: string): void {
+    delete this.store[key];
+  }
+  clear(): void {
+    this.store = {};
+  }
+}
+
+if (typeof globalThis.localStorage === "undefined" || !globalThis.localStorage.clear) {
+  (globalThis as any).localStorage = new MockLocalStorage();
+}
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "localStorage", {
+    value: (globalThis as any).localStorage,
+    writable: true,
+  });
+}
+
 // --- Mock every side-effecting dependency Web3Context imports ---------------
 // so the tests exercise only the auto-connect retry/backoff policy itself,
 // never a real wallet, RPC endpoint, or Stellar SDK.

@@ -93,6 +93,8 @@ export const LEGACY_X25519_VERSION = "x25519-xsalsa20-poly1305";
 export const HYBRID_PQC_VERSION = "hybrid-mlkem768-p256-aes256gcm-v1";
 /** Hybrid classical X25519 + ML-KEM-768 dual encapsulation. */
 export const HYBRID_PQC_X25519_VERSION = "hybrid-mlkem768-x25519-aes256gcm-v1";
+/** Fully Homomorphic Encryption (TFHE/LWE euint256) secret share envelope. */
+export const FHE_EUINT256_VERSION = "fhe-tfhe-euint256-v1";
 
 export interface HybridPublicKeys {
   /** Classical ECDH public key (P-256 SPKI or X25519 raw), Base64. */
@@ -611,3 +613,5 @@ export {
   ML_KEM_768_SECRET_KEY_BYTES,
   ML_KEM_768_SHARED_SECRET_BYTES,
 };
+
+export * from "./fheEngine";

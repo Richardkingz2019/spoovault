@@ -1,0 +1,48 @@
+[package]
+name = "spoovault-stellar-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# `testutils` is required for `Env::default()`, `Address::generate`,
+# `env.mock_all_auths()`, and `env.register_contract`. This is a normal
+# (non-dev) dependency here, unlike in the parent crate, because a
+# cargo-fuzz target is its own binary crate, not a test build of the
+# parent.
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+# Pin the same major version the parent crate's dev-dependencies use.
+# soroban-env-host's testutils code calls `ed25519_dalek::SigningKey::generate`
+# with its own `rand_chacha`-based RNG; left unpinned, a fresh (non-workspace)
+# resolution here can float `ed25519-dalek` to a newer major that expects a
+# newer, incompatible `rand_core` than the RNG soroban-env-host provides,
+# which fails to compile with a `CryptoRng` trait-bound error.
+ed25519-dalek = "2.2.0"
+
+[dependencies.spoovault_stellar]
+path = ".."
+
+[[bin]]
+name = "state_machine"
+path = "fuzz_targets/state_machine.rs"
+# `#![no_main]` + `fuzz_target!` installs libFuzzer's own `main`, which does
+# not dispatch into Rust's normal `#[test]` harness at all — `cargo test`
+# against a target built this way just runs libFuzzer standalone (an
+# unbounded fuzzing loop), so `test` stays `false` per the standard
+# cargo-fuzz template. Validate this target with `cargo check` (type-checks
+# cleanly) and `cargo +nightly fuzz run state_machine -- -max_total_time=60`;
+# the equivalent state machine is also covered by `cargo test` in the parent
+# crate via `src/fuzz_test.rs`'s proptest suite.
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]

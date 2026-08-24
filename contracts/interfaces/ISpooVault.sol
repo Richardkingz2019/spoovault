@@ -98,6 +98,9 @@ interface ISpooVault is IERC165 {
     event PublicKeyRegistered(address indexed user, string publicKey);
     event GuardianSharesSaved(uint256 indexed documentId);
     event ShareSubmittedForBeneficiary(uint256 indexed requestId, address indexed guardian, string encryptedShare);
+    event FheGuardianSharesSaved(uint256 indexed documentId, uint256 count);
+    event FheShareSubmitted(uint256 indexed requestId, address indexed guardian);
+    event FheSharesAggregated(uint256 indexed requestId, uint256 indexed documentId, address indexed requester, bytes aggregateCiphertext);
 
     /**
      * @notice Register ECIES public key for an address.
@@ -203,4 +206,38 @@ interface ISpooVault is IERC165 {
      * @param tokenId The ID of the token to burn.
      */
     function burnAccessToken(uint256 tokenId) external;
+
+    /**
+     * @notice Save FHE-encrypted shares for guardians for a document.
+     * @param documentId The ID of the document.
+     * @param guardians Array of guardian addresses.
+     * @param sharesFHE Array of FHE ciphertext bytes for each guardian.
+     */
+    function saveGuardianSharesFHE(
+        uint256 documentId,
+        address[] calldata guardians,
+        bytes[] calldata sharesFHE
+    ) external;
+
+    /**
+     * @notice Approve access request using FHE encrypted share payload.
+     * @param requestId The ID of the pending access request.
+     * @param fheSharePayload FHE encrypted share payload submitted by the guardian.
+     */
+    function approveAccessFHE(uint256 requestId, bytes calldata fheSharePayload) external;
+
+    /**
+     * @notice Returns the on-chain aggregated FHE ciphertext for an approved access request.
+     * @param requestId The ID of the access request.
+     * @return Aggregate ciphertext bytes.
+     */
+    function getFheAggregate(uint256 requestId) external view returns (bytes memory);
+
+    /**
+     * @notice Returns the FHE-encrypted share stored for a document/guardian pair.
+     * @param documentId The ID of the document.
+     * @param guardian The guardian address.
+     * @return The FHE encrypted share bytes.
+     */
+    function getFheGuardianShare(uint256 documentId, address guardian) external view returns (bytes memory);
 }
