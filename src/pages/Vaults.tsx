@@ -46,6 +46,7 @@ import { identityService } from "../services/identity.service";
 import { toast } from "react-hot-toast";
 import { buttonClasses } from "../utils/buttonClasses";
 import { pushNotificationService } from "../services/pushNotification.service";
+import { BLSKeyManagementModal } from "../components/modals/BLSKeyManagementModal";
 
 interface Vault extends VaultData {
   gid: string;
@@ -65,6 +66,7 @@ const Vaults = () => {
   const [creating, setCreating] = useState(false);
   const [togglingEmergencyVaultId, setTogglingEmergencyVaultId] = useState<number | null>(null);
   const [provingLifeVaultId, setProvingLifeVaultId] = useState<number | null>(null);
+  const [selectedBLSVaultId, setSelectedBLSVaultId] = useState<number | null>(null);
 
   const [formData, setFormData] = useState({
     name: "",
@@ -688,6 +690,18 @@ const Vaults = () => {
                         </Button>
                       </div>
                     )}
+                    {(isGuardian || isCreator) && (
+                      <div className="pt-1">
+                        <Button
+                          size="sm"
+                          className="w-full bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-600/30"
+                          startContent={<FiShield />}
+                          onPress={() => setSelectedBLSVaultId(vault.id)}
+                        >
+                          Guardian BLS Keyring
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 </CardBody>
               </Card>
@@ -977,6 +991,12 @@ const Vaults = () => {
           </ModalFooter>
         </ModalContent>
       </Modal>
+
+      <BLSKeyManagementModal
+        isOpen={selectedBLSVaultId !== null}
+        onClose={() => setSelectedBLSVaultId(null)}
+        vaultId={selectedBLSVaultId || undefined}
+      />
     </div>
   );
 };

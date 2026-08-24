@@ -53,6 +53,7 @@ import {
   importStreamingKey,
 } from "../services/streamingCrypto.service";
 import { storageProviderService } from "../services/storageProvider.service";
+import { BLSKeyManagementModal } from "../components/modals/BLSKeyManagementModal";
 // reconstructSecret is available for on-chain SSS share reconstruction when needed
 // import { reconstructSecret } from "../services/secrets.service";
 
@@ -138,6 +139,7 @@ const AccessCenter = () => {
   const hasVaultFilter =
     Number.isFinite(selectedVaultFromQuery) && selectedVaultFromQuery > 0;
   const accessibleOnly = searchParams.get("scope") === "accessible";
+  const [blsModalOpen, setBlsModalOpen] = useState(false);
 
   useEffect(() => {
     if (
@@ -944,6 +946,13 @@ const AccessCenter = () => {
           >
             Fetch Inbox Keys
           </Button>
+          <Button
+            className="w-full sm:w-auto bg-gradient-to-r from-indigo-600 to-cyan-600 text-white font-medium shadow-md hover:from-indigo-500 hover:to-cyan-500 transition-all rounded-xl"
+            startContent={<FiShield />}
+            onPress={() => setBlsModalOpen(true)}
+          >
+            Guardian BLS Key
+          </Button>
         </div>
       </div>
 
@@ -1159,6 +1168,11 @@ const AccessCenter = () => {
           </p>
         </div>
       </div>
+
+      <BLSKeyManagementModal
+        isOpen={blsModalOpen}
+        onClose={() => setBlsModalOpen(false)}
+      />
     </div>
   );
 };
