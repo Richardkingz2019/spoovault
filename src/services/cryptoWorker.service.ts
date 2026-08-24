@@ -1,7 +1,7 @@
 import { CryptoWorkerRequest, CryptoWorkerResponse } from "../workers/crypto.worker";
 import { decryptWithPrivateKey, encryptWithPublicKey } from "../utils/crypto";
 
-class CryptoWorkerService {
+export class CryptoWorkerService {
   private workers: Worker[] = [];
   private nextWorkerIndex = 0;
   private pendingRequests: Map<
