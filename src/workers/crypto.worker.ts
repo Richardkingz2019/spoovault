@@ -149,4 +149,27 @@ self.onmessage = async (event: MessageEvent<CryptoWorkerRequest>) => {
     };
     self.postMessage(errorResponse);
   }
+
+  
+};
+
+/// <reference lib="webworker" />
+
+self.onmessage = async (event: MessageEvent<{ type: string; buffer: ArrayBuffer }>) => {
+  const { type, buffer } = event.data;
+
+  if (type === 'COMPUTE_HASH') {
+    try {
+      // Process buffer directly without memory duplication
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+
+      // Return resulting ArrayBuffer back to main thread via zero-copy transfer
+      self.postMessage(
+        { status: 'SUCCESS', hash: hashBuffer },
+        [hashBuffer]
+      );
+    } catch (error: any) {
+      self.postMessage({ status: 'ERROR', message: error.message });
+    }
+  }
 };
