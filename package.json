@@ -23,7 +23,9 @@
     "e2e:stellar": "node e2e/soroban/soroban-flow.test.mjs",
     "proxy:pinata": "node scripts/pinata-proxy.mjs",
     "proxy:push-notifications": "node scripts/push-notification-proxy.mjs",
-    "gateway:soroban": "node scripts/soroban-event-gateway.mjs"
+    "gateway:soroban": "node scripts/soroban-event-gateway.mjs",
+    "relayer": "node relayer/main.ts",
+    "test:relayer": "vitest run guardianRelayer"
   },
   "dependencies": {
     "@heroui/react": "^2.0.0",
