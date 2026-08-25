@@ -2426,8 +2426,6 @@ mod test;
 mod fuzz_test;
 
 
-#![no_std]
-use soroban_sdk::{contract, contractimpl, Address, Env, Bytes};
 
 #[contract]
 pub struct FheVaultContract;
@@ -2442,7 +2440,7 @@ impl FheVaultContract {
         let mut accumulator: Bytes = storage.get(&vault_id).unwrap_or_else(|| Bytes::from_array(&env, &[0u8; 32]));
 
         // Perform homomorphic addition over ciphertext bytes
-        accumulator = Self.homomorphic_add(&env, &accumulator, &encrypted_share);
+        accumulator = Self::homomorphic_add(&env, &accumulator, &encrypted_share);
 
         storage.set(&vault_id, &accumulator);
     }
