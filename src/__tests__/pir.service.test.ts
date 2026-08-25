@@ -56,6 +56,32 @@ describe("HomomorphicHash", () => {
     expect(hash1.getSalt()).not.toBe(hash2.getSalt());
     expect(await hash1.hashCid(cid)).not.toBe(await hash2.hashCid(cid));
   });
+
+  it("produces identical hashes across separate instances given the same key", async () => {
+    const cid = "QmTest123456789";
+    const hash1 = new HomomorphicHash("shared-vault-key");
+    const hash2 = new HomomorphicHash("shared-vault-key");
+
+    expect(hash1.getSalt()).toBe(hash2.getSalt());
+    expect(await hash1.hashCid(cid)).toBe(await hash2.hashCid(cid));
+  });
+
+  it("produces different hashes for different keys", async () => {
+    const cid = "QmTest123456789";
+    const hash1 = new HomomorphicHash("key-a");
+    const hash2 = new HomomorphicHash("key-b");
+
+    expect(await hash1.hashCid(cid)).not.toBe(await hash2.hashCid(cid));
+  });
+
+  it("a keyed hash still verifies correctly against itself", async () => {
+    const cid = "QmTest123456789";
+    const homomorphicHash = new HomomorphicHash("shared-vault-key");
+    const hash = await homomorphicHash.hashCid(cid);
+
+    expect(await homomorphicHash.verifyCid(cid, hash)).toBe(true);
+    expect(await homomorphicHash.verifyCid("QmOther", hash)).toBe(false);
+  });
 });
 
 describe("DummyQueryBatcher", () => {
@@ -139,10 +165,91 @@ describe("DummyQueryBatcher", () => {
   it("should throw error if real query fails", async () => {
     const realCid = "QmTest123456789";
     const batch = batcher.createBatch(realCid);
-    
+
     const mockFetch = vi.fn().mockRejectedValue(new Error("All queries failed"));
 
     await expect(batcher.executeBatch(batch, mockFetch)).rejects.toThrow("Real query failed to execute");
+  });
+
+  it("dispatches queries concurrently rather than strictly sequentially", async () => {
+    const realCid = "QmTest123456789";
+    const batch = batcher.createBatch(realCid); // 1 real + 3 dummy = 4 queries
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const mockFetch = vi.fn().mockImplementation((cid: string) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise<Response>((resolve) => {
+        setTimeout(() => {
+          inFlight--;
+          resolve(
+            cid === realCid
+              ? new Response("real data", { status: 200 })
+              : new Response("decoy data", { status: 200 })
+          );
+        }, 20);
+      });
+    });
+
+    await batcher.executeBatch(batch, mockFetch);
+
+    // A sequential for-loop would never have more than 1 in flight at once.
+    expect(maxInFlight).toBeGreaterThan(1);
+  });
+
+  describe("decoy pool (real CIDs)", () => {
+    it("uses real CIDs from the decoy pool instead of synthetic ones", () => {
+      const realCid = "QmReal";
+      const pool = ["QmSibling1", "QmSibling2", "QmSibling3"];
+      const batch = batcher.createBatch(realCid, pool); // dummyQueryCount = 3
+
+      const decoyCids = batch.filter((q) => !q.isReal).map((q) => q.cid);
+      expect(decoyCids.sort()).toEqual([...pool].sort());
+    });
+
+    it("excludes the real CID from sampled decoys even if present in the pool", () => {
+      const realCid = "QmReal";
+      const pool = ["QmReal", "QmSibling1", "QmSibling2"];
+      const batch = batcher.createBatch(realCid, pool);
+
+      const decoyCids = batch.filter((q) => !q.isReal).map((q) => q.cid);
+      expect(decoyCids).not.toContain(realCid);
+    });
+
+    it("pads with synthetic decoys when the pool is smaller than dummyQueryCount", () => {
+      const realCid = "QmReal";
+      const pool = ["QmSibling1"]; // dummyQueryCount = 3, pool has only 1
+      const batch = batcher.createBatch(realCid, pool);
+
+      const decoyCids = batch.filter((q) => !q.isReal).map((q) => q.cid);
+      expect(decoyCids).toHaveLength(3);
+      expect(decoyCids).toContain("QmSibling1");
+    });
+
+    it("falls back to fully synthetic decoys when no pool is provided", () => {
+      const realCid = "QmReal";
+      const batch = batcher.createBatch(realCid);
+
+      const decoyCids = batch.filter((q) => !q.isReal).map((q) => q.cid);
+      expect(decoyCids).toHaveLength(3);
+      decoyCids.forEach((cid) => expect(cid).not.toBe(realCid));
+    });
+
+    it("real decoys resolve successfully just like the real query (indistinguishable by status)", async () => {
+      const realCid = "QmReal";
+      const pool = ["QmSibling1", "QmSibling2", "QmSibling3"];
+      const batch = batcher.createBatch(realCid, pool);
+
+      const mockFetch = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }));
+      const { realResult } = await batcher.executeBatch(batch, mockFetch);
+
+      expect(realResult.status).toBe(200);
+      // Every dispatched CID (real + real decoys) got a 200 in this mock —
+      // nothing in the response codes distinguishes the real request.
+      const calledCids = mockFetch.mock.calls.map((c) => c[0]);
+      expect(calledCids.sort()).toEqual([realCid, ...pool].sort());
+    });
   });
 });
 
@@ -247,6 +354,76 @@ describe("PirService", () => {
 
       expect(result.success).toBe(false); // no real gateway reachable in this environment
       expect(result.dummyQueriesIssued).toBeGreaterThanOrEqual(0);
+    });
+
+    it("passes decoyCids through to the batch so real gateways see indistinguishable requests", async () => {
+      const cid = "QmTest123456789";
+      const fetchMock = vi.fn().mockResolvedValue(new Response("data", { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await pirService.fetchDocument(cid, undefined, ["QmSibling1", "QmSibling2"]);
+
+      expect(result.success).toBe(true);
+      const requestedUrls = fetchMock.mock.calls.map((c) => String(c[0]));
+      // getURL is mocked to a fixed URL, but the important thing is that the
+      // sibling CIDs were part of the batch dispatched via fetchFn.
+      expect(fetchMock).toHaveBeenCalledTimes(3); // real + 2 decoys
+      expect(requestedUrls.length).toBe(3);
+    });
+  });
+
+  describe("fail-closed Tor behavior", () => {
+    it("never issues a network request when useTorProxy is enabled but no real proxy is available", async () => {
+      const torService = new PirService({
+        enabled: true,
+        useTorProxy: true,
+        dummyQueryCount: 2,
+        batchDelayMs: 5,
+      });
+
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const gatewaySpy = vi.spyOn(ipfsGateway, "fetchFile");
+
+      const result = await torService.fetchDocument("QmTest123456789");
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/not available/i);
+      expect(result.proxied).toBe(false);
+      // The whole point of failing closed: no request — protected or not —
+      // should ever have gone out.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(gatewaySpy).not.toHaveBeenCalled();
+
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    });
+
+    it("isTorAvailable reports false (no genuine in-browser SOCKS5 support)", async () => {
+      const torService = new PirService({ enabled: true, useTorProxy: true });
+      expect(await torService.isTorAvailable()).toBe(false);
+    });
+  });
+
+  describe("deterministic CID index key", () => {
+    it("two PirService instances with the same cidIndexKey produce the same CID hash", async () => {
+      const a = new PirService({ enabled: true, useTorProxy: false, cidIndexKey: "vault-key" });
+      const b = new PirService({ enabled: true, useTorProxy: false, cidIndexKey: "vault-key" });
+
+      const cid = "QmTest123456789";
+      expect(await a.getCidHash(cid)).toBe(await b.getCidHash(cid));
+    });
+
+    it("updateConfig({ cidIndexKey }) makes the hash deterministic going forward", async () => {
+      const service = new PirService({ enabled: true, useTorProxy: false });
+      const cid = "QmTest123456789";
+      const beforeHash = await service.getCidHash(cid);
+
+      service.updateConfig({ cidIndexKey: "vault-key" });
+      const other = new PirService({ enabled: true, useTorProxy: false, cidIndexKey: "vault-key" });
+
+      expect(await service.getCidHash(cid)).toBe(await other.getCidHash(cid));
+      expect(await service.getCidHash(cid)).not.toBe(beforeHash);
     });
   });
 });

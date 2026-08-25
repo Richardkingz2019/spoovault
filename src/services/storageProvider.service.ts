@@ -518,7 +518,8 @@ export const createStorageProviderService = (
 
   const fetchDocument = async (
     ipfsHash: string,
-    init?: RequestInit
+    init?: RequestInit,
+    decoyCids?: string[]
   ): Promise<Response> => {
     if (!ipfsHash) {
       throw new Error("IPFS CID is required");
@@ -526,7 +527,11 @@ export const createStorageProviderService = (
     const attempts: string[] = [];
 
     try {
-      return await ipfsService.fetchFile(ipfsHash, init);
+      // Routes through PIR when VITE_PIR_ENABLED is set; a no-op passthrough
+      // to the plain gateway fetch otherwise. `decoyCids` (e.g. sibling
+      // documents in the same vault) let PIR batch real, indistinguishable
+      // decoys alongside the real request.
+      return await ipfsService.fetchFileWithPIR(ipfsHash, init, decoyCids);
     } catch (error) {
       attempts.push(
         `ipfs -> ${error instanceof Error ? error.message : String(error)}`

@@ -36,15 +36,19 @@ const fetchFile = (hash: string, init?: RequestInit): Promise<Response> =>
 
 /**
  * Fetch a file from IPFS using PIR (Private Information Retrieval) if enabled.
- * This obscures which document is being fetched by batching with dummy queries
- * and optionally routing through Tor.
+ * This obscures which document is being fetched by batching it alongside
+ * decoy queries. Pass `decoyCids` (real, existing CIDs — e.g. sibling
+ * documents in the same vault) so the batch is genuinely indistinguishable
+ * to the gateway; without them, PIR falls back to weaker synthetic decoys.
+ * When PIR is disabled (default), this is equivalent to `fetchFile`.
  */
 const fetchFileWithPIR = async (
   hash: string,
-  init?: RequestInit
+  init?: RequestInit,
+  decoyCids?: string[]
 ): Promise<Response> => {
-  const pirResult = await pirService.fetchDocument(hash, init?.signal || undefined);
-  
+  const pirResult = await pirService.fetchDocument(hash, init?.signal || undefined, decoyCids);
+
   if (!pirResult.success) {
     throw new Error(pirResult.error || "PIR fetch failed");
   }

@@ -840,7 +840,13 @@ const Documents = () => {
     }
 
     // Multi-provider fetch: IPFS gateway pool first, then Filecoin/Arweave backups.
-    const response = await storageProviderService.fetchDocument(doc.ipfsHash);
+    // Sibling document CIDs from this vault are passed as PIR decoy candidates
+    // (used only when VITE_PIR_ENABLED is set) so a gateway operator sees a
+    // batch of real, indistinguishable requests rather than one bare fetch.
+    const decoyCids = documents
+      .filter((d) => d.id !== doc.id && d.ipfsHash)
+      .map((d) => d.ipfsHash);
+    const response = await storageProviderService.fetchDocument(doc.ipfsHash, undefined, decoyCids);
 
     const { isStreaming, stream } = await detectStreamingCiphertext(response.body as any);
     const metadata = decryptMetadata(doc);
