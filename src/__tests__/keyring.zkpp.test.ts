@@ -167,6 +167,43 @@ describe("Keyring ZKPP (Zero-Knowledge PIN Verification Engine)", { timeout: 600
       const decrypted = await clientKeyringService.getDecryptedPrivateKey(testAccount, pin);
       expect(decrypted).toBe(legacyKeys.privateKey);
     });
+
+    it("should automatically migrate a legacy PBKDF2 record to Argon2id upon successful unlock (issue #74)", async () => {
+      const { secretsService, PBKDF2_PAYLOAD_VERSION, ARGON2ID_PAYLOAD_VERSION } = await import(
+        "../services/secrets.service"
+      );
+      const { generateECIESKeyPairBase64 } = await import("../utils/crypto");
+
+      const legacyKeys = await generateECIESKeyPairBase64();
+      const legacyEnvelope = await secretsService.encryptWithPassphrase(
+        legacyKeys.privateKey,
+        pin,
+        600_000
+      );
+      expect(JSON.parse(legacyEnvelope).version).toBe(PBKDF2_PAYLOAD_VERSION);
+
+      await seedRecord({
+        account: testAccount,
+        publicKey: legacyKeys.publicKey,
+        encryptedPrivateKey: legacyEnvelope,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        hasPin: true,
+      });
+
+      // First unlock decrypts the legacy envelope and triggers the migration.
+      await clientKeyringService.getDecryptedPrivateKey(testAccount, pin);
+
+      const migratedRecord = (await clientKeyringService.getKeyPairRecord(testAccount))!;
+      const migratedEnvelope = JSON.parse(migratedRecord.encryptedPrivateKey);
+      expect(migratedEnvelope.version).toBe(ARGON2ID_PAYLOAD_VERSION);
+      expect(migratedEnvelope.algorithm).toBe("argon2id");
+
+      // The migrated envelope must still decrypt to the same private key.
+      clientKeyringService.clearSessionCache();
+      const decryptedAfterMigration = await clientKeyringService.getDecryptedPrivateKey(testAccount, pin);
+      expect(decryptedAfterMigration).toBe(legacyKeys.privateKey);
+    });
   });
 
   async function deleteRecord() {
