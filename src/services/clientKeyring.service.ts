@@ -969,4 +969,13 @@ export const clientKeyringService = {
     if (!account) return null;
     return sessionKeyCache.get(account.toLowerCase()) || null;
   },
+
+  /**
+   * Check if account has a configured BLS12-381 threshold keyring.
+   */
+  async hasBLSKey(account: string): Promise<boolean> {
+    if (!account) return false;
+    const { blsKeyringService } = await import("./blsKeyring.service");
+    return blsKeyringService.hasKeyForGuardian(account);
+  },
 };

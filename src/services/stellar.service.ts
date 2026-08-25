@@ -1024,6 +1024,98 @@ const approveAccess = async (requestId: number, encryptedShareForBeneficiary?: s
   saveMockStorage("requests", requests);
 };
 
+const registerGuardianBLSKey = async (
+  vaultId: number,
+  blsPublicKey: string,
+  proofOfPossession: string
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    try {
+      await executeSorobanCall("register_guardian_bls_key", [
+        activeAccount,
+        vaultId,
+        hexToBytes(blsPublicKey),
+        hexToBytes(proofOfPossession),
+      ]);
+      return;
+    } catch (err) {
+      console.error("Soroban register_guardian_bls_key failed:", err);
+      throw err;
+    }
+  }
+
+  const blsKeys = getMockStorage<Record<string, { publicKey: string; proofOfPossession: string; registered: boolean }>>("stellar_bls_keys", {});
+  const keyIdentifier = `${vaultId}_${activeAccount.toLowerCase()}`;
+  blsKeys[keyIdentifier] = {
+    publicKey: blsPublicKey,
+    proofOfPossession,
+    registered: true,
+  };
+  saveMockStorage("stellar_bls_keys", blsKeys);
+};
+
+const getGuardianBLSKey = async (
+  vaultId: number,
+  guardianAddress: string
+): Promise<{ blsPublicKey: string; proofOfPossession: string; isRegistered: boolean } | null> => {
+  const blsKeys = getMockStorage<Record<string, { publicKey: string; proofOfPossession: string; registered: boolean }>>("stellar_bls_keys", {});
+  const keyIdentifier = `${vaultId}_${guardianAddress.toLowerCase()}`;
+  const info = blsKeys[keyIdentifier];
+  if (!info) return null;
+  return {
+    blsPublicKey: info.publicKey,
+    proofOfPossession: info.proofOfPossession,
+    isRegistered: info.registered,
+  };
+};
+
+const approveAccessBLS = async (
+  requestId: number,
+  guardianAddresses: string[],
+  aggregatedSignature: string,
+  aggregatedPublicKey: string,
+  encryptedShares: string[] = []
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    try {
+      await executeSorobanCall("approve_access_bls", [
+        requestId,
+        guardianAddresses,
+        hexToBytes(aggregatedSignature),
+        hexToBytes(aggregatedPublicKey),
+        encryptedShares,
+      ]);
+      return;
+    } catch (err) {
+      console.error("Soroban approve_access_bls failed:", err);
+      throw err;
+    }
+  }
+
+  const requests = getMockStorage<MockRequest[]>("requests", []);
+  const reqIdx = requests.findIndex((r) => r.requestId === requestId);
+  if (reqIdx === -1) throw new Error("Request not found");
+
+  const req = requests[reqIdx];
+  for (let i = 0; i < guardianAddresses.length; i++) {
+    const guardian = guardianAddresses[i];
+    if (!req.approvedBy.includes(guardian)) {
+      req.approvedBy.push(guardian);
+    }
+    if (i < encryptedShares.length && encryptedShares[i]) {
+      req.beneficiaryShares[guardian] = encryptedShares[i];
+    }
+  }
+
+  req.status = 1; // Approved
+  requests[reqIdx] = req;
+  saveMockStorage("requests", requests);
+};
+
 const fetchPendingApprovalsForGuardian = async (
   guardianAddress: string
 ): Promise<StellarPendingApprovalData[]> => {
@@ -1590,6 +1682,9 @@ export const stellarService = {
   fetchDocumentsForVaults,
   requestAccess,
   approveAccess,
+  registerGuardianBLSKey,
+  getGuardianBLSKey,
+  approveAccessBLS,
   fetchPendingApprovalsForGuardian,
   getEncryptedGuardianShare,
   getBeneficiaryKeyShare,

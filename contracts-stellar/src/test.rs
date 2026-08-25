@@ -1908,4 +1908,86 @@ mod fhe_aggregation {
         let ct = create_mock_fhe_ciphertext(&env, 123);
         client.approve_access_fhe(&g1, &req_id, &ct);
     }
+
+    fn create_mock_bls_pubkey(env: &Env, seed_byte: u8) -> Bytes {
+        let mut key = [0u8; 48];
+        key[0] = 0x80 | (seed_byte & 0x7f); // compressed flag
+        for i in 1..48 {
+            key[i] = seed_byte.wrapping_add(i as u8);
+        }
+        Bytes::from_array(env, &key)
+    }
+
+    fn create_mock_bls_signature(env: &Env, seed_byte: u8) -> Bytes {
+        let mut sig = [0u8; 96];
+        sig[0] = 0x80 | (seed_byte & 0x7f); // compressed flag
+        for i in 1..96 {
+            sig[i] = seed_byte.wrapping_add(i as u8);
+        }
+        Bytes::from_array(env, &sig)
+    }
+
+    #[test]
+    fn test_register_and_get_guardian_bls_key() {
+        let (env, client, _creator, g1, _g2, vault_id) = create_test_vault();
+        accept_guardian(&client, &env, &g1, vault_id);
+
+        let pk = create_mock_bls_pubkey(&env, 42);
+        let pop = create_mock_bls_signature(&env, 42);
+
+        client.register_guardian_bls_key(&g1, &vault_id, &pk, &pop);
+
+        let info = client
+            .get_guardian_bls_key(&vault_id, &g1)
+            .expect("Key should exist");
+        assert!(info.registered);
+        assert_eq!(info.public_key, pk);
+        assert_eq!(info.proof_of_possession, pop);
+    }
+
+    #[test]
+    fn test_approve_access_bls_threshold_success() {
+        let (env, client, creator, g1, g2, vault_id) = create_test_vault();
+        accept_guardian(&client, &env, &g1, vault_id);
+        accept_guardian(&client, &env, &g2, vault_id);
+
+        let pk1 = create_mock_bls_pubkey(&env, 1);
+        let pop1 = create_mock_bls_signature(&env, 1);
+        let pk2 = create_mock_bls_pubkey(&env, 2);
+        let pop2 = create_mock_bls_signature(&env, 2);
+
+        client.register_guardian_bls_key(&g1, &vault_id, &pk1, &pop1);
+        client.register_guardian_bls_key(&g2, &vault_id, &pk2, &pop2);
+
+        let doc_id = client.add_document(
+            &creator,
+            &vault_id,
+            &String::from_str(&env, "meta"),
+            &String::from_str(&env, "ipfs-hash"),
+            &AccessLevel::Read,
+            &ReleaseCondition::Anytime,
+            &Vec::new(&env),
+            &Vec::new(&env),
+        );
+
+        let beneficiary = Address::generate(&env);
+        let req_id = client.request_access(&beneficiary, &doc_id);
+
+        let mut guardians_list = Vec::new(&env);
+        guardians_list.push_back(g1);
+        guardians_list.push_back(g2);
+
+        let agg_sig = create_mock_bls_signature(&env, 99);
+        let agg_pk = create_mock_bls_pubkey(&env, 99);
+
+        let mut shares = Vec::new(&env);
+        shares.push_back(String::from_str(&env, "share1"));
+        shares.push_back(String::from_str(&env, "share2"));
+
+        client.approve_access_bls(&req_id, &guardians_list, &agg_sig, &agg_pk, &shares);
+
+        let req = client.get_access_request(&req_id).unwrap();
+        assert_eq!(req.status, RequestStatus::Approved);
+        assert!(client.has_access(&doc_id, &beneficiary));
+    }
 }
