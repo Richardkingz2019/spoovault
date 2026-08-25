@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
-import { CryptoClientService } from '../../services/crypto-client';
+import { describe, it, expect } from 'vitest';
+import { CryptoClientService } from '../services/crypto-client';
 
 describe('CryptoWorker Zero-Copy Transfer (#42)', () => {
   it('detaches ArrayBuffer ownership upon postMessage invocation', async () => {
@@ -14,5 +14,10 @@ describe('CryptoWorker Zero-Copy Transfer (#42)', () => {
     expect(buffer.byteLength).toBe(0);
 
     client.terminate();
+    try {
+      await promise;
+    } catch {
+      // Ignored on terminated worker
+    }
   });
 });
