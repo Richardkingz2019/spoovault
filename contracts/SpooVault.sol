@@ -1570,6 +1570,28 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         return (info.publicKey, info.proofOfPossession, info.registered);
     }
 
+    function _processBLSGuardians(
+        uint256 requestId,
+        uint256 vaultId,
+        address requester,
+        address[] calldata guardianAddresses,
+        string[] calldata encryptedSharesForBeneficiary
+    ) internal {
+        uint256 guardianCount = guardianAddresses.length;
+        for (uint256 i = 0; i < guardianCount; i++) {
+            address guardian = guardianAddresses[i];
+            if (i > 0 && guardian <= guardianAddresses[i - 1]) revert DuplicateGuardianBLS();
+            if (!isGuardian[vaultId][guardian]) revert OnlyGuardian();
+            if (guardian == requester) revert CannotSelfApproveAccess();
+            if (!guardianBLSKeys[vaultId][guardian].registered) revert GuardianBLSKeyNotRegistered();
+
+            if (i < encryptedSharesForBeneficiary.length && bytes(encryptedSharesForBeneficiary[i]).length > 0) {
+                beneficiaryKeyShares[requestId][guardian] = encryptedSharesForBeneficiary[i];
+                emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedSharesForBeneficiary[i]);
+            }
+        }
+    }
+
     /**
      * @notice Approves an access request via off-chain aggregated BLS threshold signature in a single transaction.
      * @dev Replaces O(K) on-chain verification steps with 1 single pairing check, reducing multi-guardian approval
@@ -1594,18 +1616,13 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         if (guardianCount < threshold) revert ThresholdNotMetBLS();
 
         // Verify participating guardians validity, strict ascending order, and registered BLS key
-        for (uint256 i = 0; i < guardianCount; i++) {
-            address guardian = guardianAddresses[i];
-            if (i > 0 && guardian <= guardianAddresses[i - 1]) revert DuplicateGuardianBLS();
-            if (!isGuardian[vaultId][guardian]) revert OnlyGuardian();
-            if (guardian == request.requester) revert CannotSelfApproveAccess();
-            if (!guardianBLSKeys[vaultId][guardian].registered) revert GuardianBLSKeyNotRegistered();
-
-            if (i < encryptedSharesForBeneficiary.length && bytes(encryptedSharesForBeneficiary[i]).length > 0) {
-                beneficiaryKeyShares[requestId][guardian] = encryptedSharesForBeneficiary[i];
-                emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedSharesForBeneficiary[i]);
-            }
-        }
+        _processBLSGuardians(
+            requestId,
+            vaultId,
+            request.requester,
+            guardianAddresses,
+            encryptedSharesForBeneficiary
+        );
 
         // On-chain BLS Pairing Verification in 1 single pairing check
         BLSVerifier.verifyThresholdApproval(

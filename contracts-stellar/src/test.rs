@@ -1937,7 +1937,9 @@ mod fhe_aggregation {
 
         client.register_guardian_bls_key(&g1, &vault_id, &pk, &pop);
 
-        let info = client.get_guardian_bls_key(&vault_id, &g1).expect("Key should exist");
+        let info = client
+            .get_guardian_bls_key(&vault_id, &g1)
+            .expect("Key should exist");
         assert!(info.registered);
         assert_eq!(info.public_key, pk);
         assert_eq!(info.proof_of_possession, pop);

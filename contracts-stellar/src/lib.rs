@@ -1907,6 +1907,17 @@ impl SpooVaultStellar {
         req
     }
 
+    /// Check whether a user has been granted access to a document
+    pub fn has_access(env: Env, document_id: u64, user: Address) -> bool {
+        Self::bump_instance(&env);
+        let key = DataKey::HasAccess(document_id, user);
+        let has: bool = env.storage().persistent().get(&key).unwrap_or(false);
+        if env.storage().persistent().has(&key) {
+            Self::bump_persistent(&env, &key);
+        }
+        has
+    }
+
     pub fn get_invites(env: Env, guardian: Address) -> Vec<GuardianInvite> {
         Self::bump_instance(&env);
         let key = DataKey::Invites(guardian);
