@@ -1438,6 +1438,11 @@ impl SpooVaultStellar {
         record.release_state.last_proof_of_life = env.ledger().timestamp();
         record.release_state.last_proof_of_life_sequence = env.ledger().sequence();
         Self::save_vault_record(&env, vault_id, &record);
+        
+        env.events().publish(
+            (Symbol::new(&env, "prove_life"), vault_id),
+            (owner, env.ledger().timestamp()),
+        );
     }
 
     /// Authorize a Web3 Keeper (Chainlink Automation / Gelato) to relay proof-of-life
@@ -1677,6 +1682,11 @@ impl SpooVaultStellar {
 
         record.release_state.emergency_mode = enabled;
         Self::save_vault_record(&env, vault_id, &record);
+        
+        env.events().publish(
+            (Symbol::new(&env, "emergency_mode"), vault_id),
+            enabled,
+        );
     }
 
     /// Configure an optional external registry contract to be notified whenever
