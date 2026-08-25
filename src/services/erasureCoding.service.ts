@@ -421,22 +421,38 @@ export function decode(
 
 // ─── IPFS distribution ────────────────────────────────────────────────────────
 
+/** Default Lighthouse (Filecoin-backed IPFS pinning) gateway. */
+const DEFAULT_LIGHTHOUSE_GATEWAY = "https://gateway.lighthouse.storage/ipfs/";
+const LIGHTHOUSE_UPLOAD_URL = "https://upload.lighthouse.storage/api/v0/upload";
+
 /**
  * Default pinning nodes drawn from env-level configuration.
  * Each node gets a round-robin allocation of shards so that no single
  * provider holds more than ceil(N / nodeCount) shards.
  *
  * Consumers may inject custom nodes via `distributeShards({ nodes: [...] })`.
+ *
+ * Only providers with a verified, currently-operational HTTP pinning API are
+ * wired up by default (Pinata, Lighthouse/Filecoin). Infura's IPFS pinning
+ * service is not included — it was shut down permanently and no longer
+ * accepts uploads or pins.
  */
 export function buildDefaultNodes(): PinningNode[] {
-  const pinataJwt =
-    typeof import.meta !== "undefined"
-      ? (import.meta as any).env?.VITE_PINATA_JWT
-      : undefined;
+  // Bracket-notation lookup (not `import.meta.env.VITE_X`) is deliberate: Vite
+  // statically inlines literal dot-access member expressions at build time,
+  // which would bake in whatever value was present when the app was built and
+  // make this function untestable / unresponsive to runtime env changes. This
+  // mirrors the `envString` helper in storageProvider.service.ts.
+  const envString = (name: string): string | undefined => {
+    if (typeof import.meta === "undefined") return undefined;
+    const value = (import.meta.env as Record<string, unknown>)[name];
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  };
 
   const nodes: PinningNode[] = [];
 
   // Pinata
+  const pinataJwt = envString("VITE_PINATA_JWT");
   if (pinataJwt) {
     nodes.push({
       name: "pinata",
@@ -455,6 +471,38 @@ export function buildDefaultNodes(): PinningNode[] {
       fetchFn: async (cid: string): Promise<Uint8Array> => {
         const resp = await fetch(`https://gateway.pinata.cloud/ipfs/${cid}`);
         if (!resp.ok) throw new Error(`Pinata fetch failed: ${resp.status}`);
+        return new Uint8Array(await resp.arrayBuffer());
+      },
+    });
+  }
+
+  // Lighthouse (Filecoin-backed IPFS pinning) — same env vars as the
+  // permanent backup provider in storageProvider.service.ts, so a single
+  // Lighthouse API key configures both features.
+  const lighthouseApiKey = envString("VITE_LIGHTHOUSE_API_KEY");
+  if (lighthouseApiKey) {
+    const lighthouseGateway = envString("VITE_LIGHTHOUSE_GATEWAY_URL") || DEFAULT_LIGHTHOUSE_GATEWAY;
+    nodes.push({
+      name: "lighthouse",
+      uploadFn: async (data: Uint8Array, name: string): Promise<string> => {
+        const formData = new FormData();
+        formData.append("file", new Blob([data.buffer as ArrayBuffer], { type: "application/octet-stream" }), name);
+        const resp = await fetch(LIGHTHOUSE_UPLOAD_URL, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${lighthouseApiKey}` },
+          body: formData,
+        });
+        if (!resp.ok) throw new Error(`Lighthouse upload failed: ${resp.status}`);
+        const json = await resp.json();
+        const hash = json?.Hash ?? json?.hash;
+        if (typeof hash !== "string" || !hash) {
+          throw new Error("Lighthouse upload response missing Hash");
+        }
+        return hash;
+      },
+      fetchFn: async (cid: string): Promise<Uint8Array> => {
+        const resp = await fetch(`${lighthouseGateway}${cid}`);
+        if (!resp.ok) throw new Error(`Lighthouse fetch failed: ${resp.status}`);
         return new Uint8Array(await resp.arrayBuffer());
       },
     });

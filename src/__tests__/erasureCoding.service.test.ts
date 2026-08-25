@@ -21,7 +21,7 @@
  *  - config boundary: throws on 0 data or parity shards
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   encode,
   decode,
@@ -30,12 +30,16 @@ import {
   encodeAndDistribute,
   reconstructFromManifest,
   verifyShards,
+  buildDefaultNodes,
   erasureCodingService,
   DEFAULT_SHARD_CONFIG,
   type PinningNode,
 } from "../services/erasureCoding.service";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+type Env = Record<string, string | undefined>;
+const env = (): Env => import.meta.env as unknown as Env;
 
 /** Build a deterministic test payload of a given byte length. */
 function makePayload(length: number): Uint8Array {
@@ -563,6 +567,90 @@ describe("verifyShards", () => {
     expect(corrupted.length).toBeGreaterThan(0);
     // The explicitly corrupted parity shard must appear in the set
     expect(corrupted).toContain(4);
+  });
+});
+
+// ─── buildDefaultNodes ─────────────────────────────────────────────────────────
+
+describe("buildDefaultNodes", () => {
+  afterEach(() => {
+    delete env().VITE_PINATA_JWT;
+    delete env().VITE_LIGHTHOUSE_API_KEY;
+    delete env().VITE_LIGHTHOUSE_GATEWAY_URL;
+    vi.unstubAllGlobals();
+  });
+
+  it("always includes the read-only ipfs.io fallback gateway", () => {
+    const nodes = buildDefaultNodes();
+    expect(nodes.map((n) => n.name)).toContain("ipfs.io");
+  });
+
+  it("omits Pinata and Lighthouse when no credentials are configured", () => {
+    const nodes = buildDefaultNodes();
+    expect(nodes.map((n) => n.name)).not.toContain("pinata");
+    expect(nodes.map((n) => n.name)).not.toContain("lighthouse");
+  });
+
+  it("includes Pinata when VITE_PINATA_JWT is set", () => {
+    env().VITE_PINATA_JWT = "test-jwt";
+    const nodes = buildDefaultNodes();
+    expect(nodes.map((n) => n.name)).toContain("pinata");
+  });
+
+  it("includes Lighthouse when VITE_LIGHTHOUSE_API_KEY is set", () => {
+    env().VITE_LIGHTHOUSE_API_KEY = "test-lh-key";
+    const nodes = buildDefaultNodes();
+    expect(nodes.map((n) => n.name)).toContain("lighthouse");
+  });
+
+  it("includes both Pinata and Lighthouse alongside ipfs.io when both are configured", () => {
+    env().VITE_PINATA_JWT = "test-jwt";
+    env().VITE_LIGHTHOUSE_API_KEY = "test-lh-key";
+    const nodes = buildDefaultNodes();
+    expect(nodes.map((n) => n.name).sort()).toEqual(["ipfs.io", "lighthouse", "pinata"]);
+  });
+
+  it("Lighthouse uploadFn/fetchFn call the configured upload and gateway endpoints", async () => {
+    env().VITE_LIGHTHOUSE_API_KEY = "test-lh-key";
+    env().VITE_LIGHTHOUSE_GATEWAY_URL = "https://custom.gateway/ipfs/";
+    const nodes = buildDefaultNodes();
+    const lighthouse = nodes.find((n) => n.name === "lighthouse")!;
+    expect(lighthouse).toBeDefined();
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ Hash: "bafylighthouse" }), { status: 200 })
+      )
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const cid = await lighthouse.uploadFn(new Uint8Array([9, 9, 9]), "shard-0-data");
+    expect(cid).toBe("bafylighthouse");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://upload.lighthouse.storage/api/v0/upload",
+      expect.objectContaining({ method: "POST" })
+    );
+
+    const bytes = await lighthouse.fetchFn("bafylighthouse");
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "https://custom.gateway/ipfs/bafylighthouse");
+    expect(bytes).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it("Lighthouse uploadFn throws when the response is missing a Hash", async () => {
+    env().VITE_LIGHTHOUSE_API_KEY = "test-lh-key";
+    const nodes = buildDefaultNodes();
+    const lighthouse = nodes.find((n) => n.name === "lighthouse")!;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }))
+    );
+
+    await expect(lighthouse.uploadFn(new Uint8Array([1]), "shard")).rejects.toThrow(
+      "Lighthouse upload response missing Hash"
+    );
   });
 });
 
