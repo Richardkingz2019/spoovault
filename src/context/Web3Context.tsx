@@ -7,8 +7,13 @@ import {
   type StellarWalletChangeEvent,
 } from "../services/stellar.service";
 import { sorobanEventIndexer } from "../services/sorobanEventIndexer.service";
+import { blsKeyringService } from "../services/blsKeyring.service";
+import type { BLSKeyPair, BLSSignatureShare, BLSAggregatedApprovalPayload } from "../types/bls";
 
 const CONTRACT_ABI = [
+  "function registerGuardianBLSKey(uint256 vaultId, bytes blsPublicKey, bytes proofOfPossession) external",
+  "function getGuardianBLSKey(uint256 vaultId, address guardian) external view returns (bytes, bytes, bool)",
+  "function approveAccessBLS(uint256 requestId, address[] guardianAddresses, bytes aggregatedSignature, bytes aggregatedPublicKey, string[] encryptedSharesForBeneficiary) external",
   "function createVault(string name, string description, address[] guardians, uint256 approvalThreshold) external returns (uint256)",
   "function acceptGuardianInvite(uint256 vaultId) external",
   "function addDocument(uint256 vaultId, string encryptedMetadata, string ipfsHash, uint8 requiredAccess) external returns (uint256)",
@@ -73,6 +78,17 @@ interface Web3ContextType {
   ecosystem: "avalanche" | "stellar";
   setEcosystem: (eco: "avalanche" | "stellar") => void;
   stellarNetwork: string | null;
+  blsKeyPair: BLSKeyPair | null;
+  generateBLSKey: () => Promise<BLSKeyPair>;
+  registerBLSKeyForVault: (vaultId: number) => Promise<void>;
+  signBLSApproval: (
+    requestId: number,
+    vaultId: number,
+    documentId: number,
+    beneficiary: string,
+    encryptedBeneficiaryShare?: string
+  ) => Promise<BLSSignatureShare>;
+  submitBLSBatchApproval: (payload: BLSAggregatedApprovalPayload) => Promise<void>;
 }
 
 const Web3Context = createContext<Web3ContextType | undefined>(undefined);
@@ -86,6 +102,7 @@ export const Web3Provider = ({ children }: { children: ReactNode }) => {
   const [isConnecting, setIsConnecting] = useState(false);
   const [isDisconnecting, setIsDisconnecting] = useState(false);
   const [stellarNetwork, setStellarNetwork] = useState<string | null>(null);
+  const [blsKeyPair, setBlsKeyPair] = useState<BLSKeyPair | null>(null);
 
   const [ecosystem, setEcosystemState] = useState<"avalanche" | "stellar">(() => {
     if (typeof window !== "undefined") {
@@ -493,6 +510,68 @@ export const Web3Provider = ({ children }: { children: ReactNode }) => {
     }
   };
 
+  useEffect(() => {
+    if (!account) {
+      setBlsKeyPair(null);
+      return;
+    }
+    blsKeyringService.getKeyForGuardian(account).then((key) => {
+      setBlsKeyPair(key);
+    }).catch(() => {
+      setBlsKeyPair(null);
+    });
+  }, [account]);
+
+  const generateBLSKey = async (): Promise<BLSKeyPair> => {
+    if (!account) throw new Error("Wallet not connected");
+    const key = await blsKeyringService.generateKeyForGuardian(account);
+    setBlsKeyPair(key);
+    toast.success("BLS12-381 keypair generated with Proof of Possession");
+    return key;
+  };
+
+  const registerBLSKeyForVault = async (vaultId: number): Promise<void> => {
+    if (!account) throw new Error("Wallet not connected");
+    let key = blsKeyPair;
+    if (!key) {
+      key = await generateBLSKey();
+    }
+    await contractService.registerGuardianBLSKey(vaultId, key.publicKey, key.proofOfPossession);
+    await blsKeyringService.linkVaultToKey(account, vaultId);
+    toast.success("BLS public key registered for vault guardian");
+  };
+
+  const signBLSApproval = async (
+    requestId: number,
+    vaultId: number,
+    documentId: number,
+    beneficiary: string,
+    encryptedBeneficiaryShare?: string
+  ): Promise<BLSSignatureShare> => {
+    if (!account) throw new Error("Wallet not connected");
+    return blsKeyringService.signAccessApproval(
+      account,
+      requestId,
+      vaultId,
+      documentId,
+      beneficiary,
+      encryptedBeneficiaryShare,
+      undefined,
+      chainId || 31337
+    );
+  };
+
+  const submitBLSBatchApproval = async (payload: BLSAggregatedApprovalPayload): Promise<void> => {
+    await contractService.approveAccessBLS(
+      payload.requestId,
+      payload.guardianAddresses,
+      payload.aggregatedSignature,
+      payload.aggregatedPublicKey,
+      payload.encryptedSharesForBeneficiary
+    );
+    toast.success("Batch threshold approval executed on-chain with BLS aggregation!");
+  };
+
   const value = {
     provider,
     signer,
@@ -508,6 +587,11 @@ export const Web3Provider = ({ children }: { children: ReactNode }) => {
     ecosystem,
     setEcosystem,
     stellarNetwork,
+    blsKeyPair,
+    generateBLSKey,
+    registerBLSKeyForVault,
+    signBLSApproval,
+    submitBLSBatchApproval,
   };
 
   return <Web3Context.Provider value={value}>{children}</Web3Context.Provider>;

@@ -53,6 +53,7 @@ import {
   importStreamingKey,
 } from "../services/streamingCrypto.service";
 import { storageProviderService } from "../services/storageProvider.service";
+import { BLSKeyManagementModal } from "../components/modals/BLSKeyManagementModal";
 // reconstructSecret is available for on-chain SSS share reconstruction when needed
 // import { reconstructSecret } from "../services/secrets.service";
 
@@ -138,6 +139,7 @@ const AccessCenter = () => {
   const hasVaultFilter =
     Number.isFinite(selectedVaultFromQuery) && selectedVaultFromQuery > 0;
   const accessibleOnly = searchParams.get("scope") === "accessible";
+  const [blsModalOpen, setBlsModalOpen] = useState(false);
 
   useEffect(() => {
     if (
@@ -698,7 +700,13 @@ const AccessCenter = () => {
     }
 
     // Multi-provider fetch: IPFS gateway pool first, then Filecoin/Arweave backups.
-    const response = await storageProviderService.fetchDocument(doc.ipfsHash);
+    // Sibling document CIDs are passed as PIR decoy candidates (used only when
+    // VITE_PIR_ENABLED is set) so a gateway operator sees a batch of real,
+    // indistinguishable requests rather than one bare fetch.
+    const decoyCids = documents
+      .filter((d) => d.id !== doc.id && d.ipfsHash)
+      .map((d) => d.ipfsHash);
+    const response = await storageProviderService.fetchDocument(doc.ipfsHash, undefined, decoyCids);
     if (!response.body) {
       throw new Error("Empty response received from IPFS");
     }
@@ -944,6 +952,13 @@ const AccessCenter = () => {
           >
             Fetch Inbox Keys
           </Button>
+          <Button
+            className="w-full sm:w-auto bg-gradient-to-r from-indigo-600 to-cyan-600 text-white font-medium shadow-md hover:from-indigo-500 hover:to-cyan-500 transition-all rounded-xl"
+            startContent={<FiShield />}
+            onPress={() => setBlsModalOpen(true)}
+          >
+            Guardian BLS Key
+          </Button>
         </div>
       </div>
 
@@ -1159,6 +1174,11 @@ const AccessCenter = () => {
           </p>
         </div>
       </div>
+
+      <BLSKeyManagementModal
+        isOpen={blsModalOpen}
+        onClose={() => setBlsModalOpen(false)}
+      />
     </div>
   );
 };

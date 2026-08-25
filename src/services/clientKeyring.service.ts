@@ -6,7 +6,7 @@ import {
   stringToUint8Array,
 } from "../utils/crypto";
 
-import { secretsService, PBKDF2_ITERATIONS } from "./secrets.service";
+import { secretsService, PBKDF2_ITERATIONS, PBKDF2_PAYLOAD_VERSION } from "./secrets.service";
 import {
   WebAuthnError,
   authenticatePasskey,
@@ -400,19 +400,45 @@ const unlockRecord = async (
     }
   }
 
-  // Legacy (pre-ZKPP) records: PBKDF2 envelope with embedded salt.
+  // Legacy (pre-ZKPP) records: PBKDF2 or Argon2id envelope with embedded salt.
   if (!record.encryptedPrivateKey) {
     throw new Error("No decryptable key material in keyring record");
   }
   const { passphrase } = getEffectivePassphrase(normalized, pinOrPassphrase);
   try {
-    return await secretsService.decryptWithPassphrase(record.encryptedPrivateKey, passphrase);
+    const privateKey = await secretsService.decryptWithPassphrase(record.encryptedPrivateKey, passphrase);
+    await migrateLegacyPbkdf2EnvelopeIfNeeded(record, passphrase, privateKey);
+    return privateKey;
   } catch {
     throw new Error(
       record.hasPin
         ? "Incorrect PIN or passphrase. Please verify your PIN."
         : "Failed to decrypt client private key from secure storage."
     );
+  }
+};
+
+/**
+ * Migration & Backwards Compatibility (issue #74): once a legacy PBKDF2
+ * envelope has been successfully decrypted, transparently re-encrypt the
+ * private key under the memory-hard Argon2id KDF and persist it in place,
+ * so subsequent logins never touch PBKDF2 again. Best-effort only -- a
+ * migration hiccup must never fail an otherwise-successful unlock.
+ */
+const migrateLegacyPbkdf2EnvelopeIfNeeded = async (
+  record: KeyPairRecord,
+  passphrase: string,
+  privateKey: string
+): Promise<void> => {
+  try {
+    const envelope = JSON.parse(record.encryptedPrivateKey);
+    if (envelope?.version !== PBKDF2_PAYLOAD_VERSION) {
+      return;
+    }
+    const upgradedEnvelope = await secretsService.encryptWithPassphrase(privateKey, passphrase);
+    await idbPut({ ...record, encryptedPrivateKey: upgradedEnvelope, updatedAt: Date.now() });
+  } catch {
+    // Best-effort upgrade only; the caller already has a valid decrypted key.
   }
 };
 
@@ -878,10 +904,10 @@ export const clientKeyringService = {
     const privateKey = await this.getDecryptedPrivateKey(normalized, currentPin);
     const publicKey = (await this.getStoredPublicKey(normalized)) || "";
 
+    // Argon2id by default (issue #74) -- memory-hard against GPU/ASIC cracking.
     const encryptedForBackup = await secretsService.encryptWithPassphrase(
       privateKey,
-      backupPassphrase.trim(),
-      PBKDF2_ITERATIONS
+      backupPassphrase.trim()
     );
 
     const backupPayload: KeyPairBackupPayload = {
@@ -968,5 +994,14 @@ export const clientKeyringService = {
   getCachedPrivateKeyBytes(account: string): Uint8Array | null {
     if (!account) return null;
     return sessionKeyCache.get(account.toLowerCase()) || null;
+  },
+
+  /**
+   * Check if account has a configured BLS12-381 threshold keyring.
+   */
+  async hasBLSKey(account: string): Promise<boolean> {
+    if (!account) return false;
+    const { blsKeyringService } = await import("./blsKeyring.service");
+    return blsKeyringService.hasKeyForGuardian(account);
   },
 };

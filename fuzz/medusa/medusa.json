@@ -78,7 +78,7 @@
         "--solc-remaps",
         "@openzeppelin/=../../node_modules/@openzeppelin/",
         "--solc-args",
-        "--optimize --optimize-runs 200 --evm-version cancun --allow-paths ../.."
+        "--optimize --optimize-runs 200 --evm-version cancun --allow-paths ../.. --via-ir"
       ]
     }
   },

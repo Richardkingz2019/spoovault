@@ -858,6 +858,56 @@ const approveAccess = async (requestId: number, encryptedShareForBeneficiary?: s
   await waitForReceipt(tx);
 };
 
+const registerGuardianBLSKey = async (
+  vaultId: number,
+  blsPublicKey: string,
+  proofOfPossession: string
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  const tx = await contract.registerGuardianBLSKey(vaultId, blsPublicKey, proofOfPossession);
+  await waitForReceipt(tx);
+};
+
+const getGuardianBLSKey = async (
+  vaultId: number,
+  guardian: string
+): Promise<{ blsPublicKey: string; proofOfPossession: string; isRegistered: boolean }> => {
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  try {
+    const res = await contract.getGuardianBLSKey(vaultId, guardian);
+    return {
+      blsPublicKey: res[0],
+      proofOfPossession: res[1],
+      isRegistered: Boolean(res[2]),
+    };
+  } catch {
+    return {
+      blsPublicKey: "",
+      proofOfPossession: "",
+      isRegistered: false,
+    };
+  }
+};
+
+const approveAccessBLS = async (
+  requestId: number,
+  guardianAddresses: string[],
+  aggregatedSignature: string,
+  aggregatedPublicKey: string,
+  encryptedSharesForBeneficiary: string[] = []
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  const tx = await contract.approveAccessBLS(
+    requestId,
+    guardianAddresses,
+    aggregatedSignature,
+    aggregatedPublicKey,
+    encryptedSharesForBeneficiary
+  );
+  await waitForReceipt(tx);
+};
+
 const registerPublicKey = async (publicKey: string): Promise<void> => {
   const contract = ensureWriteContract();
   const tx = await contract.registerPublicKey(publicKey);
@@ -2144,6 +2194,53 @@ const proxiedMintAccessToken = async (
   return mintAccessToken(vaultId, to, tokenURI);
 };
 
+const proxiedRegisterGuardianBLSKey = async (
+  vaultId: number,
+  blsPublicKey: string,
+  proofOfPossession: string
+): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.registerGuardianBLSKey(vaultId, blsPublicKey, proofOfPossession);
+  }
+  return registerGuardianBLSKey(vaultId, blsPublicKey, proofOfPossession);
+};
+
+const proxiedGetGuardianBLSKey = async (
+  vaultId: number,
+  guardian: string
+): Promise<{ blsPublicKey: string; proofOfPossession: string; isRegistered: boolean }> => {
+  if (getEcosystem() === "stellar") {
+    const info = await stellarService.getGuardianBLSKey(vaultId, guardian);
+    return info || { blsPublicKey: "", proofOfPossession: "", isRegistered: false };
+  }
+  return getGuardianBLSKey(vaultId, guardian);
+};
+
+const proxiedApproveAccessBLS = async (
+  requestId: number,
+  guardianAddresses: string[],
+  aggregatedSignature: string,
+  aggregatedPublicKey: string,
+  encryptedSharesForBeneficiary: string[] = []
+): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.approveAccessBLS(
+      requestId,
+      guardianAddresses,
+      aggregatedSignature,
+      aggregatedPublicKey,
+      encryptedSharesForBeneficiary
+    );
+  }
+  return approveAccessBLS(
+    requestId,
+    guardianAddresses,
+    aggregatedSignature,
+    aggregatedPublicKey,
+    encryptedSharesForBeneficiary
+  );
+};
+
 export const contractService = {
   initialize,
   clear,
@@ -2152,6 +2249,9 @@ export const contractService = {
   addDocument: proxiedAddDocument,
   requestAccess: proxiedRequestAccess,
   approveAccess: proxiedApproveAccess,
+  registerGuardianBLSKey: proxiedRegisterGuardianBLSKey,
+  getGuardianBLSKey: proxiedGetGuardianBLSKey,
+  approveAccessBLS: proxiedApproveAccessBLS,
   acceptGuardianInvite: proxiedAcceptGuardianInvite,
   mintAccessToken: proxiedMintAccessToken,
   burnAccessToken,

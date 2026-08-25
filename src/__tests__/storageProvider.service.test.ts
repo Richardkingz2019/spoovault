@@ -1,16 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-vi.mock("../services/ipfs.service", () => ({
-  ipfsService: {
-    isConfigured: vi.fn(() => true),
-    getURL: vi.fn((hash: string) => `https://gateway.pinata.cloud/ipfs/${hash}`),
-    getGatewayPool: vi.fn(() => ["https://gateway.pinata.cloud/ipfs/"]),
-    fetchFile: vi.fn(),
-    uploadFile: vi.fn(),
-    uploadStream: vi.fn(),
-    unpin: vi.fn(),
-  },
-}));
+vi.mock("../services/ipfs.service", () => {
+  const fetchFile = vi.fn();
+  return {
+    ipfsService: {
+      isConfigured: vi.fn(() => true),
+      getURL: vi.fn((hash: string) => `https://gateway.pinata.cloud/ipfs/${hash}`),
+      getGatewayPool: vi.fn(() => ["https://gateway.pinata.cloud/ipfs/"]),
+      fetchFile,
+      // fetchDocument routes through fetchFileWithPIR (PIR-aware; a no-op
+      // passthrough to fetchFile when PIR is disabled). Delegating to the
+      // same fetchFile mock keeps every existing fetchFile-based test valid
+      // unchanged; tests that care about PIR-specific behavior (decoyCids)
+      // assert on fetchFileWithPIR directly instead.
+      fetchFileWithPIR: vi.fn((hash: string, init?: RequestInit) => fetchFile(hash, init)),
+      uploadFile: vi.fn(),
+      uploadStream: vi.fn(),
+      unpin: vi.fn(),
+    },
+  };
+});
 
 import {
   BACKUP_REFS_STORAGE_KEY,
@@ -471,6 +480,18 @@ describe("StorageProviderService", () => {
 
       expect(response).toBe(primary);
       expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("routes reads through the PIR-aware fetch and forwards decoyCids (oblivious proxy integration point)", async () => {
+      const { service } = makeService();
+      const primary = new Response("from-ipfs");
+      vi.mocked(ipfsService.fetchFile).mockResolvedValueOnce(primary);
+
+      const decoyCids = ["QmSibling1", "QmSibling2"];
+      const response = await service.fetchDocument("QmOk", undefined, decoyCids);
+
+      expect(response).toBe(primary);
+      expect(ipfsService.fetchFileWithPIR).toHaveBeenCalledWith("QmOk", undefined, decoyCids);
     });
 
     it("falls back to Arweave when every IPFS gateway fails", async () => {

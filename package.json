@@ -23,7 +23,9 @@
     "e2e:stellar": "node e2e/soroban/soroban-flow.test.mjs",
     "proxy:pinata": "node scripts/pinata-proxy.mjs",
     "proxy:push-notifications": "node scripts/push-notification-proxy.mjs",
-    "gateway:soroban": "node scripts/soroban-event-gateway.mjs"
+    "gateway:soroban": "node scripts/soroban-event-gateway.mjs",
+    "relayer": "node relayer/main.ts",
+    "test:relayer": "vitest run guardianRelayer"
   },
   "dependencies": {
     "@heroui/react": "^2.0.0",
@@ -42,6 +44,7 @@
     "dotenv": "^16.3.1",
     "ethers": "^6.13.0",
     "framer-motion": "^11.5.6",
+    "hash-wasm": "^4.12.0",
     "mlkem": "^2.7.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

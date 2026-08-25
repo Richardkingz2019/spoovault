@@ -1,3 +1,5 @@
+import { argon2WorkerService, ARGON2ID_DEFAULTS } from "./argon2Worker.service";
+
 /**
  * Shamir's Secret Sharing (SSS) over Galois Field GF(256)
  *
@@ -377,27 +379,58 @@ export function parseEncryptedMetadataPayload(payloadStr: string): {
 }
 
 /**
- * Passphrase-based key derivation for backup/keyring exports (issue #20)
+ * Passphrase-based key derivation for backup/keyring exports (issue #20,
+ * migrated to Argon2id in issue #74)
  *
  * Raw user passphrases were previously used directly as AES keys when
  * exporting/restoring vault backup keys, which is vulnerable to offline
  * brute-force/dictionary attacks if a backup blob is intercepted. These
- * functions derive a strong AES-256-GCM key from the passphrase via
- * PBKDF2-SHA256 (600,000 iterations, per OWASP guidance) instead.
+ * functions derive a strong AES-256-GCM key from the passphrase.
+ *
+ * New payloads use memory-hard Argon2id (M=64MB, t=3, p=4) executed in a
+ * Web Worker so GPU/ASIC parallel cracking is dramatically more expensive
+ * than the PBKDF2-SHA256 scheme previously used. Existing PBKDF2 payloads
+ * (version `pbkdf2-sha256-aes256gcm-v1`) remain fully decryptable -- the
+ * `version` field on each payload selects which KDF re-derives the key.
  */
 
 export const PBKDF2_ITERATIONS = 600_000;
 const SALT_LENGTH_BYTES = 16;
 const IV_LENGTH_BYTES = 12; // standard AES-GCM nonce size
-const PASSPHRASE_PAYLOAD_VERSION = "pbkdf2-sha256-aes256gcm-v1";
+export const PBKDF2_PAYLOAD_VERSION = "pbkdf2-sha256-aes256gcm-v1";
+export const ARGON2ID_PAYLOAD_VERSION = "argon2id-aes256gcm-v1";
 
 export interface PassphraseEncryptedPayload {
   version: string;
+  algorithm: "pbkdf2" | "argon2id";
+  /** PBKDF2 iteration count, or Argon2id time cost (t), depending on `algorithm`. */
   iterations: number;
+  /** Argon2id only: memory cost in KiB. */
+  memorySize?: number;
+  /** Argon2id only: degree of parallelism. */
+  parallelism?: number;
   salt: string; // base64
   iv: string; // base64
   ciphertext: string; // base64
 }
+
+/** Explicit PBKDF2 request: re-derive with the legacy KDF (kept for backup formats predating issue #74). */
+export interface Pbkdf2KdfOptions {
+  algorithm: "pbkdf2";
+  iterations?: number;
+}
+
+/** Explicit (or default) Argon2id request. */
+export interface Argon2idKdfOptions {
+  algorithm: "argon2id";
+  memorySize?: number;
+  iterations?: number;
+  parallelism?: number;
+}
+
+export type KdfOptions = Pbkdf2KdfOptions | Argon2idKdfOptions;
+
+const DEFAULT_KDF_OPTIONS: KdfOptions = { algorithm: "argon2id" };
 
 const getWebCrypto = (): Crypto => {
   const cryptoObj: Crypto | undefined =
@@ -440,10 +473,11 @@ const bytesToBase64 = (bytes: Uint8Array): string => {
 
 /**
  * Derive an AES-256-GCM CryptoKey from a user passphrase using PBKDF2
- * (SHA-256, 600,000 iterations by default). A random, unique salt must be
- * supplied per encryption so the same passphrase never derives the same
- * key twice. The derived key is non-extractable (raw bits never leave
- * the Web Crypto API).
+ * (SHA-256, 600,000 iterations by default). Kept for legacy payloads
+ * (version `pbkdf2-sha256-aes256gcm-v1`) predating the Argon2id migration
+ * (issue #74). A random, unique salt must be supplied per encryption so the
+ * same passphrase never derives the same key twice. The derived key is
+ * non-extractable (raw bits never leave the Web Crypto API).
  */
 export async function deriveKeyFromPassphrase(
   passphrase: string,
@@ -472,42 +506,110 @@ export async function deriveKeyFromPassphrase(
 }
 
 /**
+ * Derive an AES-256-GCM CryptoKey from a user passphrase using memory-hard
+ * Argon2id (issue #74). The expensive hashing runs in a Web Worker via
+ * `argon2WorkerService` so the main thread -- and UI frame rate -- is never
+ * blocked; only the resulting key bytes are imported into a non-extractable
+ * Web Crypto key.
+ */
+export async function deriveKeyFromPassphraseArgon2id(
+  passphrase: string,
+  salt: Uint8Array,
+  params: {
+    memorySize?: number;
+    iterations?: number;
+    parallelism?: number;
+  } = {}
+): Promise<CryptoKey> {
+  if (!passphrase) {
+    throw new Error("Passphrase must not be empty");
+  }
+  const keyBytes = await argon2WorkerService.deriveKeyBytesAsync(passphrase, salt, {
+    memorySize: params.memorySize ?? ARGON2ID_DEFAULTS.memorySize,
+    iterations: params.iterations ?? ARGON2ID_DEFAULTS.iterations,
+    parallelism: params.parallelism ?? ARGON2ID_DEFAULTS.parallelism,
+    hashLength: ARGON2ID_DEFAULTS.hashLength,
+  });
+
+  return getWebCrypto().subtle.importKey(
+    "raw",
+    keyBytes as BufferSource,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+/**
  * Encrypt a backup/keyring payload (e.g. a hex vault key, or a reconstructed
  * guardian secret) with a user-supplied passphrase. Returns a self-describing
- * JSON payload carrying the salt, IV, and iteration count needed to re-derive
+ * JSON payload carrying the salt, IV, and KDF parameters needed to re-derive
  * the same key on decrypt -- never the raw passphrase or derived key.
+ *
+ * Defaults to memory-hard Argon2id (issue #74). Pass either a plain number
+ * (legacy shorthand, kept for existing callers) or `{ algorithm: "pbkdf2" }`
+ * to produce a legacy PBKDF2 payload instead.
  */
 export async function encryptWithPassphrase(
   plaintext: string,
   passphrase: string,
-  iterations: number = PBKDF2_ITERATIONS
+  kdf: number | KdfOptions = DEFAULT_KDF_OPTIONS
 ): Promise<string> {
+  const options: KdfOptions = typeof kdf === "number" ? { algorithm: "pbkdf2", iterations: kdf } : kdf;
   const salt = getRandomBytes(SALT_LENGTH_BYTES);
   const iv = getRandomBytes(IV_LENGTH_BYTES);
-  const key = await deriveKeyFromPassphrase(passphrase, salt, iterations);
+
+  let payload: PassphraseEncryptedPayload;
+  let key: CryptoKey;
+
+  if (options.algorithm === "pbkdf2") {
+    const iterations = options.iterations ?? PBKDF2_ITERATIONS;
+    key = await deriveKeyFromPassphrase(passphrase, salt, iterations);
+    payload = {
+      version: PBKDF2_PAYLOAD_VERSION,
+      algorithm: "pbkdf2",
+      iterations,
+      salt: bytesToBase64(salt),
+      iv: bytesToBase64(iv),
+      ciphertext: "",
+    };
+  } else {
+    const memorySize = options.memorySize ?? ARGON2ID_DEFAULTS.memorySize;
+    const iterations = options.iterations ?? ARGON2ID_DEFAULTS.iterations;
+    const parallelism = options.parallelism ?? ARGON2ID_DEFAULTS.parallelism;
+    key = await deriveKeyFromPassphraseArgon2id(passphrase, salt, {
+      memorySize,
+      iterations,
+      parallelism,
+    });
+    payload = {
+      version: ARGON2ID_PAYLOAD_VERSION,
+      algorithm: "argon2id",
+      iterations,
+      memorySize,
+      parallelism,
+      salt: bytesToBase64(salt),
+      iv: bytesToBase64(iv),
+      ciphertext: "",
+    };
+  }
 
   const ciphertextBuffer = await getWebCrypto().subtle.encrypt(
     { name: "AES-GCM", iv: iv as BufferSource },
     key,
     utf8ToBytes(plaintext) as BufferSource
   );
-
-  const payload: PassphraseEncryptedPayload = {
-    version: PASSPHRASE_PAYLOAD_VERSION,
-    iterations,
-    salt: bytesToBase64(salt),
-    iv: bytesToBase64(iv),
-    ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
-  };
+  payload.ciphertext = bytesToBase64(new Uint8Array(ciphertextBuffer));
 
   return JSON.stringify(payload);
 }
 
 /**
  * Decrypt a payload produced by encryptWithPassphrase. Re-derives the key
- * from the supplied passphrase using the embedded salt/iteration count. An
- * incorrect passphrase fails the AES-GCM authentication tag check (throws)
- * rather than silently producing garbage plaintext.
+ * from the supplied passphrase using the embedded salt and KDF parameters,
+ * dispatching to Argon2id or legacy PBKDF2 based on the payload's `version`.
+ * An incorrect passphrase fails the AES-GCM authentication tag check
+ * (throws) rather than silently producing garbage plaintext.
  */
 export async function decryptWithPassphrase(
   payloadJson: string,
@@ -520,18 +622,22 @@ export async function decryptWithPassphrase(
     throw new Error("Invalid encrypted backup payload");
   }
 
-  if (payload.version !== PASSPHRASE_PAYLOAD_VERSION) {
-    throw new Error(`Unsupported backup payload version: ${payload.version}`);
-  }
-
   const salt = base64ToBytes(payload.salt);
   const iv = base64ToBytes(payload.iv);
   const ciphertext = base64ToBytes(payload.ciphertext);
-  const key = await deriveKeyFromPassphrase(
-    passphrase,
-    salt,
-    payload.iterations
-  );
+
+  let key: CryptoKey;
+  if (payload.version === PBKDF2_PAYLOAD_VERSION) {
+    key = await deriveKeyFromPassphrase(passphrase, salt, payload.iterations);
+  } else if (payload.version === ARGON2ID_PAYLOAD_VERSION) {
+    key = await deriveKeyFromPassphraseArgon2id(passphrase, salt, {
+      memorySize: payload.memorySize,
+      iterations: payload.iterations,
+      parallelism: payload.parallelism,
+    });
+  } else {
+    throw new Error(`Unsupported backup payload version: ${payload.version}`);
+  }
 
   let plaintextBuffer: ArrayBuffer;
   try {
@@ -555,6 +661,7 @@ export const secretsService = {
   verifyShare,
   reconstructSecret,
   deriveKeyFromPassphrase,
+  deriveKeyFromPassphraseArgon2id,
   encryptWithPassphrase,
   decryptWithPassphrase,
   parseEncryptedMetadataPayload,
