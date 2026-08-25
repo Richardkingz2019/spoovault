@@ -25,6 +25,15 @@ module.exports = {
       metadata: {
         bytecodeHash: "none",
       },
+      // Requests solc's storageLayout output (slot/offset per state
+      // variable) into artifacts/build-info/*.json so storage packing can be
+      // inspected/verified without a separate plugin — see
+      // scripts/print-storage-layout.mjs.
+      outputSelection: {
+        "*": {
+          "*": ["storageLayout"],
+        },
+      },
     },
   },
   gasReporter: {
