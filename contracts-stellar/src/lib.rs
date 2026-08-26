@@ -2455,7 +2455,7 @@ impl FheVaultContract {
         storage.set(&vault_id, &accumulator);
     }
 
-    fn homomorphic_add(_env: &Env, base: &Bytes, incoming: &Bytes) -> Bytes {
+    fn homomorphic_add(_env: &Env, base: &Bytes, _incoming: &Bytes) -> Bytes {
         // TFHE-rs homomorphic ciphertext addition stub over byte vectors
         base.clone()
     }
