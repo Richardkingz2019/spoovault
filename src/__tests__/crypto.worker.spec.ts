@@ -6,9 +6,10 @@ describe('CryptoWorker Zero-Copy Transfer (#42)', () => {
 
   beforeAll(() => {
     if (typeof globalThis.Worker === 'undefined') {
-      globalThis.Worker = class {
-        onmessage: any = null;
-        onerror: any = null;
+      globalThis.Worker = class MockWorker {
+        onmessage: ((e: any) => void) | null = null;
+        onerror: ((e: any) => void) | null = null;
+
         postMessage(_msg: any, transfer?: Transferable[]) {
           if (transfer) {
             for (const item of transfer) {
@@ -21,8 +22,18 @@ describe('CryptoWorker Zero-Copy Transfer (#42)', () => {
               }
             }
           }
+          queueMicrotask(() => {
+            if (this.onmessage) {
+              this.onmessage({ data: { status: 'success', hash: new ArrayBuffer(32) } });
+            }
+          });
         }
-        terminate() {}
+
+        terminate() {
+          if (this.onerror) {
+            this.onerror(new Error('Worker terminated'));
+          }
+        }
       } as any;
     }
   });
