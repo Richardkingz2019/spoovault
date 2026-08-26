@@ -2,7 +2,6 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -12,6 +11,33 @@ import "./interfaces/IVRFCoordinatorV2Plus.sol";
 import "./libs/FHEEngine.sol";
 import "./libs/BLSVerifier.sol";
 
+/// @title ReentrancyGuardTransient — EIP-1153 transient storage re-entrancy lock
+/// @notice Uses tstore/tload (Cancun) instead of SSTORE/SLOAD for cheaper locks.
+abstract contract ReentrancyGuardTransient {
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    modifier nonReentrant() {
+        require(_loadReentrantGuard() != ENTERED, "ReentrancyGuard: reentrant call");
+        _storeReentrantGuard(ENTERED);
+        _;
+        _storeReentrantGuard(NOT_ENTERED);
+    }
+
+    modifier nonReentrantView() {
+        require(_loadReentrantGuard() != ENTERED, "ReentrancyGuard: reentrant view call");
+        _;
+    }
+
+    function _loadReentrantGuard() private view returns (uint256 result) {
+        assembly { result := tload(0) }
+    }
+
+    function _storeReentrantGuard(uint256 value) private {
+        assembly { tstore(0, value) }
+    }
+}
+
 /**
  * @title SpooVault
  * @dev NFT-powered multi-signature encrypted document vault.
@@ -19,7 +45,7 @@ import "./libs/BLSVerifier.sol";
  *      document access delegations through a standardized, ERC-165 discoverable
  *      interface.
  */
-contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
+contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     using Strings for uint256;
     uint256 private _tokenIdCounter;
     uint256 private _vaultIdCounter;
@@ -705,7 +731,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         AccessLevel requiredAccess,
         address[] calldata guardiansList,
         string[] calldata shares
-    ) external returns (uint256) {
+    ) external nonReentrant returns (uint256) {
         return _addDocument(
             vaultId,
             encryptedMetadata,
@@ -907,7 +933,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     }
 
     /// @notice Returns the beneficiary wallet address configured for `vaultId`, or the zero address if unset.
-    function getBeneficiary(uint256 vaultId) external view returns (address) {
+    function getBeneficiary(uint256 vaultId) external view nonReentrantView returns (address) {
         return _vaultBeneficiary[vaultId];
     }
 
@@ -1034,7 +1060,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Fetch vault release state summary.
      */
-    function getVaultReleaseState(uint256 vaultId) external view returns (
+    function getVaultReleaseState(uint256 vaultId) external view nonReentrantView returns (
         bool emergencyMode,
         uint256 inactivityPeriod,
         uint256 lastProofOfLife,
@@ -1805,7 +1831,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Get vault details.
      */
-    function getVault(uint256 vaultId) external view returns (
+    function getVault(uint256 vaultId) external view nonReentrantView returns (
         uint256 id,
         address creator,
         string memory name,
@@ -1831,7 +1857,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Get user's pending invites.
      */
-    function getPendingInvites(address user) external view returns (GuardianInvite[] memory) {
+    function getPendingInvites(address user) external view nonReentrantView returns (GuardianInvite[] memory) {
         uint256[] storage vaultIds = userInviteVaultIds[user];
         uint256 count = 0;
 
@@ -1859,21 +1885,21 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Return vault id attached to token id (0 if missing/deleted).
      */
-    function getTokenVault(uint256 tokenId) external view returns (uint256) {
+    function getTokenVault(uint256 tokenId) external view nonReentrantView returns (uint256) {
         return tokenVaultMapping[tokenId];
     }
 
     /**
      * @dev Returns whether user currently holds any token for vault.
      */
-    function hasVaultToken(address user, uint256 vaultId) external view returns (bool) {
+    function hasVaultToken(address user, uint256 vaultId) external view nonReentrantView returns (bool) {
         return _ownsVaultToken(user, vaultId);
     }
 
     /**
      * @dev Returns effective access, tied to both granted access and live vault token ownership.
      */
-    function hasActiveAccess(uint256 documentId, address user) external view returns (bool) {
+    function hasActiveAccess(uint256 documentId, address user) external view nonReentrantView returns (bool) {
         if (documents[documentId].id == 0) {
             return false;
         }
@@ -1886,7 +1912,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      *      third-party DApps can branch without catching reverts.
      * @return code 0 = document does not exist, 1 = access denied, 2 = access granted.
      */
-    function checkAccess(uint256 documentId, address user) external view returns (uint8) {
+    function checkAccess(uint256 documentId, address user) external view nonReentrantView returns (uint8) {
         if (documents[documentId].id == 0) {
             return 0; // DOCUMENT_NOT_FOUND
         }
@@ -1924,7 +1950,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Total active NFT supply (minted - burned).
      */
-    function totalSupply() external view returns (uint256) {
+    function totalSupply() external view nonReentrantView returns (uint256) {
         return _activeTokenSupply;
     }
 
