@@ -211,6 +211,22 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     error GuardianBLSKeyNotRegistered();
     error ThresholdNotMetBLS();
     error DuplicateGuardianBLS();
+    error DelegationInvalidOrExpired();
+
+    bytes32 public constant GUARDIAN_DELEGATION_TYPEHASH = keccak256(
+        "GuardianDelegation(address guardian,address delegate,uint256 vaultId,uint256 validUntil,uint256 nonce)"
+    );
+
+    struct GuardianDelegation {
+        address guardian;
+        address delegate;
+        uint256 vaultId;
+        uint256 validUntil;
+        uint256 nonce;
+    }
+
+    // guardian => nonce => isRevoked
+    mapping(address => mapping(uint256 => bool)) public revokedNonces;
 
     struct GuardianBLSKeyInfo {
         bytes publicKey;
@@ -1582,6 +1598,141 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         }
 
         emit AccessApproved(requestId, msg.sender);
+
+        if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
+            if (!_ownsVaultToken(request.requester, vaultId)) {
+                request.status = RequestStatus.REJECTED;
+                return;
+            }
+
+            request.status = RequestStatus.APPROVED;
+            _grantAccess(requestId, request.documentId, request.requester);
+        }
+    }
+
+    /**
+     * @notice Instantly revokes an off-chain EIP-712 delegation nonce for the caller.
+     * @param nonce The delegation nonce to invalidate.
+     */
+    function revokeDelegation(uint256 nonce) external {
+        revokedNonces[msg.sender][nonce] = true;
+        emit DelegationRevoked(msg.sender, nonce);
+    }
+
+    /**
+     * @notice Verifies an EIP-712 typed data guardian delegation signature.
+     * @param guardian The guardian address granting delegation.
+     * @param delegate The delegate authorized to act on behalf of the guardian.
+     * @param vaultId The vault for which delegation is valid.
+     * @param validUntil Expiration timestamp for the delegation.
+     * @param nonce Replay and revocation tracking nonce.
+     * @param signature 65-byte ECDSA signature over the EIP-712 typed struct hash.
+     * @return bool True if the signature is valid, unexpired, unrevoked, and guardian belongs to vault.
+     */
+    function verifyDelegation(
+        address guardian,
+        address delegate,
+        uint256 vaultId,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) public view returns (bool) {
+        if (block.timestamp > validUntil) return false;
+        if (revokedNonces[guardian][nonce]) return false;
+        if (!isGuardian[vaultId][guardian]) return false;
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                GUARDIAN_DELEGATION_TYPEHASH,
+                guardian,
+                delegate,
+                vaultId,
+                validUntil,
+                nonce
+            )
+        );
+        bytes32 digest = _hashTypedDataV4(structHash);
+        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError) {
+            return false;
+        }
+        return recovered == guardian;
+    }
+
+    /**
+     * @notice Approves a document access request on behalf of a guardian using a valid EIP-712 delegation.
+     * @param requestId Document access request ID.
+     * @param guardian The guardian who signed the delegation.
+     * @param validUntil Expiration timestamp for the delegation.
+     * @param nonce Replay and revocation tracking nonce.
+     * @param signature EIP-712 ECDSA signature by the guardian.
+     */
+    function approveAccessDelegated(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) external nonReentrant {
+        _approveAccessDelegated(requestId, guardian, validUntil, nonce, signature, "");
+    }
+
+    /**
+     * @notice Approves a document access request with beneficiary key share on behalf of a guardian using a valid EIP-712 delegation.
+     * @param requestId Document access request ID.
+     * @param guardian The guardian who signed the delegation.
+     * @param validUntil Expiration timestamp for the delegation.
+     * @param nonce Replay and revocation tracking nonce.
+     * @param signature EIP-712 ECDSA signature by the guardian.
+     * @param encryptedShareForBeneficiary Beneficiary key share encrypted with beneficiary public key.
+     */
+    function approveAccessDelegated(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature,
+        string calldata encryptedShareForBeneficiary
+    ) external nonReentrant {
+        _approveAccessDelegated(requestId, guardian, validUntil, nonce, signature, encryptedShareForBeneficiary);
+    }
+
+    function _approveAccessDelegated(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature,
+        string memory encryptedShareForBeneficiary
+    ) internal {
+        AccessRequest storage request = accessRequests[requestId];
+        if (request.requestId == 0) revert RequestNotExist();
+        if (request.status != RequestStatus.PENDING) revert RequestNotPending();
+        if (request.expiresAt <= block.timestamp) revert RequestExpired();
+        if (request.requester == guardian || request.requester == msg.sender) revert CannotSelfApproveAccess();
+
+        uint256 vaultId = documents[request.documentId].vaultId;
+        if (!verifyDelegation(guardian, msg.sender, vaultId, validUntil, nonce, signature)) {
+            revert DelegationInvalidOrExpired();
+        }
+
+        if (hasApprovedRequest[requestId][guardian]) revert AlreadyApproved();
+
+        bytes memory guardianKey = bytes(userPublicKeys[guardian]);
+        if (guardianKey.length != 0 && _revokedKeyHashes[keccak256(guardianKey)]) {
+            revert RevokedPublicKey();
+        }
+
+        hasApprovedRequest[requestId][guardian] = true;
+        request.approvedBy.push(guardian);
+
+        if (bytes(encryptedShareForBeneficiary).length > 0) {
+            beneficiaryKeyShares[requestId][guardian] = encryptedShareForBeneficiary;
+            emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedShareForBeneficiary);
+        }
+
+        emit AccessApproved(requestId, guardian);
+        emit DelegatedApprovalSubmitted(requestId, guardian, msg.sender);
 
         if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
             if (!_ownsVaultToken(request.requester, vaultId)) {
