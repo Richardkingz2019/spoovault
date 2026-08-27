@@ -343,17 +343,21 @@ describe("SpooPaymaster - EIP-4337 Gasless Guardian Approvals", function () {
       );
 
       const paymasterAddress = await paymaster.getAddress();
+      const paymasterAndData = ethers.concat([
+        paymasterAddress,
+        ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [VAULT_ID]),
+      ]);
       const userOp = {
         sender: guardianAccAddr,
-        nonce: 1n,
+        nonce: 0n,
         initCode: "0x",
         callData: accountCallData,
-        callGasLimit: 200000n,
+        callGasLimit: 500000n,
         verificationGasLimit: 150000n,
         preVerificationGas: 50000n,
         maxFeePerGas: 1000000000n,
         maxPriorityFeePerGas: 1000000000n,
-        paymasterAndData: paymasterAddress,
+        paymasterAndData,
         signature: "0x",
       };
 
