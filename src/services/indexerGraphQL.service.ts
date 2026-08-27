@@ -239,10 +239,10 @@ export function createIndexerClient(config: IndexerClientConfig): IndexerClientH
     exchanges: [
       cacheExchange,
       subscriptionExchange({
-        forwardSubscription(request) {
+        forwardSubscription(request: any) {
           const input = { ...request, query: request.query ?? "" };
           return {
-            subscribe(sink) {
+            subscribe(sink: any) {
               const unsubscribe = wsClient.subscribe(input, sink);
               return { unsubscribe };
             },
@@ -293,7 +293,7 @@ export function subscribeToVaultActivity(
 ): () => void {
   const { unsubscribe } = client
     .subscription(VAULT_ACTIVITY_SUBSCRIPTION, { vaultGid })
-    .subscribe((result) => {
+    .subscribe((result: any) => {
       if (result.error) {
         onError?.(new Error(result.error.message));
         return;
