@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { CryptoClientService } from '../services/crypto-client';
 
 class MockWorker {
@@ -22,6 +22,46 @@ if (typeof globalThis.Worker === 'undefined') {
 }
 
 describe('CryptoWorker Zero-Copy Transfer (#42)', () => {
+  const originalWorker = globalThis.Worker;
+
+  beforeAll(() => {
+    if (typeof globalThis.Worker === 'undefined') {
+      globalThis.Worker = class MockWorker {
+        onmessage: ((e: any) => void) | null = null;
+        onerror: ((e: any) => void) | null = null;
+
+        postMessage(_msg: any, transfer?: Transferable[]) {
+          if (transfer) {
+            for (const item of transfer) {
+              if (item instanceof ArrayBuffer) {
+                try {
+                  (item as any).transfer?.();
+                } catch {
+                  Object.defineProperty(item, 'byteLength', { value: 0, configurable: true });
+                }
+              }
+            }
+          }
+          queueMicrotask(() => {
+            if (this.onmessage) {
+              this.onmessage({ data: { status: 'success', hash: new ArrayBuffer(32) } });
+            }
+          });
+        }
+
+        terminate() {
+          if (this.onerror) {
+            this.onerror(new Error('Worker terminated'));
+          }
+        }
+      } as any;
+    }
+  });
+
+  afterAll(() => {
+    globalThis.Worker = originalWorker;
+  });
+
   it('detaches ArrayBuffer ownership upon postMessage invocation', async () => {
     const client = new CryptoClientService();
     const buffer = new ArrayBuffer(1024 * 1024); // 1 MB payload
