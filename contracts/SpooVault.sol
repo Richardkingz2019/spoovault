@@ -134,12 +134,13 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
 
     // Never returned as a raw struct externally (`getVaultReleaseState`
     // manually rebuilds its own return tuple), so free to reorder: all four
-    // fields pack into a single slot.
+    // fields pack into a single slot. `targetBlocks` occupies its own slot.
     struct VaultReleaseState {
         bool emergencyMode;
         uint40 inactivityPeriod;
         uint40 lastProofOfLife;
         uint40 lastProofOfLifeBlock;
+        uint256 targetBlocks;
     }
 
     struct KeeperAuthorization {
@@ -318,6 +319,25 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     // (via link_cross_chain_vault) need this enabled.
     mapping(uint256 => bool) public crossChainRevocationEnabled;
     mapping(uint256 => VaultReleaseState) private _vaultReleaseStates;
+
+    // ------------------------------------------------------------------
+    // Cumulative block-weighted time tracking (issue #86).
+    //
+    // A ring buffer of recent block timestamps lets us compute a median
+    // block interval that is resistant to single-block timestamp spoofing
+    // (miners may nudge block.timestamp by +/- 15s). That median interval
+    // converts the configured inactivity period into a target block count,
+    // so post-death unlock requires BOTH a real timestamp threshold AND a
+    // proportional number of blocks to have been mined.
+    // ------------------------------------------------------------------
+    uint256 public constant BLOCK_HISTORY_SIZE = 256;
+    uint256 private _blockHistoryHead;
+    uint256[BLOCK_HISTORY_SIZE] private _blockTimestamps;
+    uint256 private _blockHistoryCount;
+
+    /// @dev Default assumed block interval (seconds) used before the ring
+    /// buffer has accumulated enough samples to compute a median.
+    uint256 private constant DEFAULT_BLOCK_INTERVAL = 12;
     mapping(uint256 => address) private _vaultBeneficiary;
 
     // ------------------------------------------------------------------
@@ -589,7 +609,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
             emergencyMode: false,
             inactivityPeriod: 30 days,
             lastProofOfLife: uint40(block.timestamp),
-            lastProofOfLifeBlock: uint40(block.number)
+            lastProofOfLifeBlock: uint40(block.number),
+            targetBlocks: 30 days / getMedianBlockInterval()
         });
 
         newVault.guardians.push(msg.sender);
@@ -784,6 +805,9 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
 
     /**
      * @dev Configure how long owner inactivity unlocks post-death mode.
+     *      Also computes the target block count from the inactivity period
+     *      and the current median block interval, so the block-delta gate
+     *      scales proportionally to the configured inactivity window.
      */
     function configureVaultRelease(uint256 vaultId, uint256 inactivityPeriod) external nonReentrant {
         if (vaults[vaultId].id == 0) revert VaultNotExist();
@@ -793,8 +817,15 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
             revert InvalidInactivityPeriod();
         }
 
-        _vaultReleaseStates[vaultId].lastProofOfLife = uint40(block.timestamp);
-        _vaultReleaseStates[vaultId].inactivityPeriod = uint40(inactivityPeriod);
+        uint256 medianInterval = getMedianBlockInterval();
+        uint256 targetBlocks = inactivityPeriod / medianInterval;
+
+        VaultReleaseState storage state = _vaultReleaseStates[vaultId];
+        state.lastProofOfLife = uint40(block.timestamp);
+        state.lastProofOfLifeBlock = uint40(block.number);
+        state.inactivityPeriod = uint40(inactivityPeriod);
+        state.targetBlocks = targetBlocks;
+
         emit VaultReleaseConfigured(vaultId, inactivityPeriod);
     }
 
@@ -877,7 +908,94 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     function _recordProofOfLife(uint256 vaultId) internal {
         _vaultReleaseStates[vaultId].lastProofOfLife = uint40(block.timestamp);
         _vaultReleaseStates[vaultId].lastProofOfLifeBlock = uint40(block.number);
+        _recordBlockTimestamp();
         emit ProofOfLifeRecorded(vaultId, vaults[vaultId].creator, block.timestamp, getVaultGID(vaultId));
+    }
+
+    /**
+     * @dev Appends the current block.timestamp into the ring buffer used for
+     *      median block-interval estimation. Called on every proof-of-life so
+     *      the buffer samples real block progression over the vault's lifetime.
+     */
+    function _recordBlockTimestamp() internal {
+        _blockTimestamps[_blockHistoryHead] = block.timestamp;
+        _blockHistoryHead = (_blockHistoryHead + 1) % BLOCK_HISTORY_SIZE;
+        if (_blockHistoryCount < BLOCK_HISTORY_SIZE) {
+            _blockHistoryCount++;
+        }
+    }
+
+    /**
+     * @notice Returns the median block interval (seconds) derived from the
+     *         ring buffer of recent block timestamps. Resistant to single-block
+     *         timestamp spoofing because one manipulated sample is diluted by
+     *         the surrounding honest samples in the median.
+     * @return medianInterval The median interval in seconds (minimum 1).
+     */
+    function getMedianBlockInterval() public view returns (uint256 medianInterval) {
+        if (_blockHistoryCount < 2) {
+            return DEFAULT_BLOCK_INTERVAL;
+        }
+
+        // Copy timestamps into a memory array for sorting.
+        uint256[] memory timestamps = new uint256[](_blockHistoryCount);
+        uint256 start = (_blockHistoryHead + BLOCK_HISTORY_SIZE - _blockHistoryCount) % BLOCK_HISTORY_SIZE;
+        for (uint256 i = 0; i < _blockHistoryCount; i++) {
+            timestamps[i] = _blockTimestamps[(start + i) % BLOCK_HISTORY_SIZE];
+        }
+
+        // Insertion sort (buffer is small; O(n^2) is acceptable here).
+        for (uint256 i = 1; i < _blockHistoryCount; i++) {
+            uint256 key = timestamps[i];
+            uint256 j = i;
+            while (j > 0 && timestamps[j - 1] > key) {
+                timestamps[j] = timestamps[j - 1];
+                j--;
+            }
+            timestamps[j] = key;
+        }
+
+        // Compute consecutive intervals and median over those. Using the
+        // median of intervals (rather than the mean) discards outlier gaps
+        // caused by chain reorganizations or transient manipulation.
+        uint256 intervalCount = _blockHistoryCount - 1;
+        uint256[] memory intervals = new uint256[](intervalCount);
+        for (uint256 i = 1; i < _blockHistoryCount; i++) {
+            intervals[i - 1] = timestamps[i] - timestamps[i - 1];
+        }
+
+        for (uint256 i = 1; i < intervalCount; i++) {
+            uint256 key = intervals[i];
+            uint256 j = i;
+            while (j > 0 && intervals[j - 1] > key) {
+                intervals[j] = intervals[j - 1];
+                j--;
+            }
+            intervals[j] = key;
+        }
+
+        if (intervalCount % 2 == 0) {
+            uint256 a = intervals[(intervalCount / 2) - 1];
+            uint256 b = intervals[intervalCount / 2];
+            medianInterval = (a + b) / 2;
+        } else {
+            medianInterval = intervals[intervalCount / 2];
+        }
+
+        if (medianInterval == 0) {
+            medianInterval = 1;
+        }
+    }
+
+    /**
+     * @notice Returns the target block count required for post-death unlock
+     *         of `vaultId`, computed as inactivityPeriod / medianBlockInterval.
+     *         This scales the block-delta requirement proportionally to the
+     *         configured inactivity period instead of using a fixed constant.
+     */
+    function getTargetBlocks(uint256 vaultId) public view returns (uint256) {
+        if (vaults[vaultId].id == 0) revert VaultNotExist();
+        return _vaultReleaseStates[vaultId].targetBlocks;
     }
 
     /// @notice Returns the stable cross-chain identifier for an EVM vault.
@@ -2185,7 +2303,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
         }
 
         bool timestampExpired = block.timestamp >= state.lastProofOfLife + state.inactivityPeriod;
-        bool blocksElapsed = block.number >= state.lastProofOfLifeBlock + MIN_POST_DEATH_BLOCK_DELTA;
+        bool blocksElapsed = block.number >= state.lastProofOfLifeBlock + state.targetBlocks;
 
         return timestampExpired && blocksElapsed;
     }
