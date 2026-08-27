@@ -11,30 +11,23 @@ import "./interfaces/IVRFCoordinatorV2Plus.sol";
 import "./libs/FHEEngine.sol";
 import "./libs/BLSVerifier.sol";
 
-/// @title ReentrancyGuardTransient — EIP-1153 transient storage re-entrancy lock
-/// @notice Uses tstore/tload (Cancun) instead of SSTORE/SLOAD for cheaper locks.
+/// @title ReentrancyGuardTransient — Universal storage re-entrancy lock with view protection
+/// @notice Provides nonReentrant mutative protection and nonReentrantView read-only protection.
 abstract contract ReentrancyGuardTransient {
+    uint256 private _reentrancyStatus;
     uint256 private constant NOT_ENTERED = 1;
     uint256 private constant ENTERED = 2;
 
     modifier nonReentrant() {
-        require(_loadReentrantGuard() != ENTERED, "ReentrancyGuard: reentrant call");
-        _storeReentrantGuard(ENTERED);
+        require(_reentrancyStatus != ENTERED, "ReentrancyGuard: reentrant call");
+        _reentrancyStatus = ENTERED;
         _;
-        _storeReentrantGuard(NOT_ENTERED);
+        _reentrancyStatus = NOT_ENTERED;
     }
 
     modifier nonReentrantView() {
-        require(_loadReentrantGuard() != ENTERED, "ReentrancyGuard: reentrant view call");
+        require(_reentrancyStatus != ENTERED, "ReentrancyGuard: reentrant view call");
         _;
-    }
-
-    function _loadReentrantGuard() private view returns (uint256 result) {
-        assembly { result := tload(0) }
-    }
-
-    function _storeReentrantGuard(uint256 value) private {
-        assembly { tstore(0, value) }
     }
 }
 
