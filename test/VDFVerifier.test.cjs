@@ -18,7 +18,7 @@ describe("VDFVerifier", function () {
   });
 
   beforeEach(async function () {
-    const Factory = await ethers.getContractFactory("VDFVerifier");
+    const Factory = await ethers.getContractFactory("contracts/VDFVerifier.sol:VDFVerifier");
     verifier = await Factory.deploy();
     await verifier.waitForDeployment();
   });

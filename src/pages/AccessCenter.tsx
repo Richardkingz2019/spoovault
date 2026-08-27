@@ -35,7 +35,6 @@ import {
 import { buttonClasses } from "../utils/buttonClasses";
 import {
   decryptData,
-  fetchFromIPFS,
   formatDate,
   isValidAddress,
   shortenAddress,
@@ -43,6 +42,7 @@ import {
 import { toast } from "react-hot-toast";
 import { captureError } from "../services/telemetry.service";
 import { keyInboxService } from "../services/keyInbox.service";
+import { keyEnvelopeGCService } from "../services/keyEnvelopeGC.service";
 import { keyStoreService } from "../services/keyStore.service";
 import { decryptWithPrivateKey } from "../utils/crypto";
 import { clientKeyringService } from "../services/clientKeyring.service";
@@ -52,6 +52,8 @@ import {
   detectStreamingCiphertext,
   importStreamingKey,
 } from "../services/streamingCrypto.service";
+import { storageProviderService } from "../services/storageProvider.service";
+import { BLSKeyManagementModal } from "../components/modals/BLSKeyManagementModal";
 // reconstructSecret is available for on-chain SSS share reconstruction when needed
 // import { reconstructSecret } from "../services/secrets.service";
 
@@ -105,27 +107,45 @@ interface InboxKeyPreviewItem {
 
 const AccessCenter = () => {
   const [searchParams, setSearchParams] = useSearchParams();
-  const { account, isConnected, connect, provider, signer, isFujiNetwork, ecosystem } = useWeb3();
+  const {
+    account,
+    isConnected,
+    connect,
+    provider,
+    signer,
+    isFujiNetwork,
+    ecosystem,
+  } = useWeb3();
 
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [fetchingInboxKeys, setFetchingInboxKeys] = useState(false);
   const [requestingDocId, setRequestingDocId] = useState<number | null>(null);
   const [inboxEnvelopeCount, setInboxEnvelopeCount] = useState(0);
-  const [inboxPreviewItems, setInboxPreviewItems] = useState<InboxKeyPreviewItem[]>([]);
+  const [inboxPreviewItems, setInboxPreviewItems] = useState<
+    InboxKeyPreviewItem[]
+  >([]);
   const [documents, setDocuments] = useState<DocumentData[]>([]);
   const [vaults, setVaults] = useState<VaultData[]>([]);
   const [tokens, setTokens] = useState<TokenData[]>([]);
-  const [activeAccessByDoc, setActiveAccessByDoc] = useState<Record<number, boolean>>({});
-  const [latestRequestByDoc, setLatestRequestByDoc] = useState<Record<number, AccessRequestData | null>>({});
+  const [activeAccessByDoc, setActiveAccessByDoc] = useState<
+    Record<number, boolean>
+  >({});
+  const [latestRequestByDoc, setLatestRequestByDoc] = useState<
+    Record<number, AccessRequestData | null>
+  >({});
   const keyImportInputRef = useRef<HTMLInputElement | null>(null);
   const selectedVaultFromQuery = Number(searchParams.get("vault") || "");
   const hasVaultFilter =
     Number.isFinite(selectedVaultFromQuery) && selectedVaultFromQuery > 0;
   const accessibleOnly = searchParams.get("scope") === "accessible";
+  const [blsModalOpen, setBlsModalOpen] = useState(false);
 
   useEffect(() => {
-    if (isConnected && (ecosystem === "stellar" || (provider && signer && isFujiNetwork))) {
+    if (
+      isConnected &&
+      (ecosystem === "stellar" || (provider && signer && isFujiNetwork))
+    ) {
       if (ecosystem !== "stellar" && provider && signer) {
         contractService.initialize(provider, signer);
       }
@@ -153,7 +173,8 @@ const AccessCenter = () => {
         contractService.fetchVaultsForAccount(account),
       ]);
       const scopedDocs = await contractService.fetchDocumentsForVaults(
-        visibleVaults.map((vault) => vault.id)
+        visibleVaults.map((vault) => vault.id),
+        account
       );
       const docIds = scopedDocs.map((doc) => doc.id);
       const [accessMap, requestMap] = await Promise.all([
@@ -166,10 +187,26 @@ const AccessCenter = () => {
       setTokens(tokenData);
       setActiveAccessByDoc(accessMap);
       setLatestRequestByDoc(requestMap);
+
+      // Automated unpinning GC trigger for any expired or rejected requests
+      if (keyInboxService.isConfigured() && docIds.length > 0) {
+        keyEnvelopeGCService
+          .runGarbageCollection({
+            account,
+            documentIds: docIds,
+          })
+          .catch((err) => {
+            console.error(
+              "Automated key envelope GC background check error:",
+              err
+            );
+          });
+      }
     } catch (error) {
       console.error("Error loading beneficiary access data:", error);
       captureError("accessCenter.loadData", error, { account: account || "" });
-      const message = error instanceof Error ? error.message : "Failed to load access data";
+      const message =
+        error instanceof Error ? error.message : "Failed to load access data";
       toast.error(message);
     } finally {
       setLoading(false);
@@ -200,18 +237,24 @@ const AccessCenter = () => {
 
       let decryptedKey = key;
       const isEncryptedPayload =
-        (key.includes("ciphertext") && (key.includes("ephemPublicKey") || key.includes("version"))) ||
+        (key.includes("ciphertext") &&
+          (key.includes("ephemPublicKey") || key.includes("version"))) ||
         key.trim().startsWith("{");
 
       if (isEncryptedPayload) {
         if (!account) {
-          throw new Error("Connect your wallet before importing this key package");
+          throw new Error(
+            "Connect your wallet before importing this key package"
+          );
         }
         toast("Decrypting key package from secure keyring...");
-        const beneficiaryPrivateKey = await clientKeyringService.getDecryptedPrivateKey(account);
+        const beneficiaryPrivateKey =
+          await clientKeyringService.getDecryptedPrivateKey(account);
         decryptedKey = await decryptWithPrivateKey(key, beneficiaryPrivateKey);
         if (!decryptedKey) {
-          throw new Error("Failed to decrypt key package with keyring private key");
+          throw new Error(
+            "Failed to decrypt key package with keyring private key"
+          );
         }
       }
 
@@ -220,17 +263,27 @@ const AccessCenter = () => {
       }
       if (beneficiary) {
         if (!isValidAddress(beneficiary)) {
-          throw new Error("Invalid key package: beneficiary wallet address is invalid");
+          throw new Error(
+            "Invalid key package: beneficiary wallet address is invalid"
+          );
         }
         if (!account) {
-          throw new Error("Connect your wallet before importing this key package");
+          throw new Error(
+            "Connect your wallet before importing this key package"
+          );
         }
         if (beneficiary.toLowerCase() !== account.toLowerCase()) {
           throw new Error("This key package is issued for a different wallet");
         }
       }
-      if (fileContract && expectedContract && fileContract !== expectedContract) {
-        throw new Error("This key package is for a different SpooVault contract");
+      if (
+        fileContract &&
+        expectedContract &&
+        fileContract !== expectedContract
+      ) {
+        throw new Error(
+          "This key package is for a different SpooVault contract"
+        );
       }
       if (
         Number.isFinite(fileChainId) &&
@@ -239,7 +292,9 @@ const AccessCenter = () => {
         expectedChainId > 0 &&
         fileChainId !== expectedChainId
       ) {
-        throw new Error("This key package is for a different blockchain network");
+        throw new Error(
+          "This key package is for a different blockchain network"
+        );
       }
 
       keyStoreService.set(documentId, decryptedKey);
@@ -296,7 +351,10 @@ const AccessCenter = () => {
         }
         const currentTs = Date.parse(current.issuedAt || "");
         const nextTs = Date.parse(envelope.issuedAt || "");
-        if ((Number.isNaN(currentTs) ? 0 : currentTs) <= (Number.isNaN(nextTs) ? 0 : nextTs)) {
+        if (
+          (Number.isNaN(currentTs) ? 0 : currentTs) <=
+          (Number.isNaN(nextTs) ? 0 : nextTs)
+        ) {
           latestByDoc.set(docId, envelope);
         }
       }
@@ -311,7 +369,8 @@ const AccessCenter = () => {
         }
 
         const isEncrypted =
-          (key.includes("ciphertext") && (key.includes("ephemPublicKey") || key.includes("version"))) ||
+          (key.includes("ciphertext") &&
+            (key.includes("ephemPublicKey") || key.includes("version"))) ||
           key.trim().startsWith("{");
         if (!isEncrypted && !/^[a-fA-F0-9]{64}$/.test(key)) {
           continue;
@@ -320,7 +379,11 @@ const AccessCenter = () => {
         const vaultName = vaultNameById[vaultId] || `Vault #${vaultId || "?"}`;
         const envelopeContract = (envelope.contract || "").toLowerCase();
         const envelopeChainId = Number(envelope.chainId);
-        if (expectedContract && envelopeContract && envelopeContract !== expectedContract) {
+        if (
+          expectedContract &&
+          envelopeContract &&
+          envelopeContract !== expectedContract
+        ) {
           skippedWrongContract += 1;
           previews.push({
             documentId,
@@ -349,7 +412,10 @@ const AccessCenter = () => {
           continue;
         }
 
-        const hasAccess = await contractService.hasActiveAccess(documentId, account);
+        const hasAccess = await contractService.hasActiveAccess(
+          documentId,
+          account
+        );
         if (!hasAccess) {
           skippedNotApproved += 1;
           previews.push({
@@ -359,14 +425,31 @@ const AccessCenter = () => {
             issuedAt: envelope.issuedAt || "",
             status: "awaiting_approval",
           });
+
+          // If request is expired or rejected, automatically trigger unpinning GC
+          const req = latestRequestByDoc[documentId];
+          if (keyEnvelopeGCService.isRequestExpiredOrRejected(req)) {
+            keyEnvelopeGCService
+              .unpinEnvelopesForRequest({
+                documentId,
+                beneficiary: account,
+                reason:
+                  req?.status === 2 ? "request_rejected" : "request_expired",
+              })
+              .catch(() => {});
+          }
           continue;
         }
 
         let decryptedKey = key;
         if (isEncrypted) {
           try {
-            const beneficiaryPrivateKey = await clientKeyringService.getDecryptedPrivateKey(account);
-            decryptedKey = await decryptWithPrivateKey(key, beneficiaryPrivateKey);
+            const beneficiaryPrivateKey =
+              await clientKeyringService.getDecryptedPrivateKey(account);
+            decryptedKey = await decryptWithPrivateKey(
+              key,
+              beneficiaryPrivateKey
+            );
             if (!decryptedKey || !/^[a-fA-F0-9]{64}$/.test(decryptedKey)) {
               continue;
             }
@@ -389,13 +472,22 @@ const AccessCenter = () => {
 
       if (imported > 0) {
         await loadData();
-        toast.success(`Imported ${imported} key${imported > 1 ? "s" : ""} from inbox`);
+        toast.success(
+          `Imported ${imported} key${imported > 1 ? "s" : ""} from inbox`
+        );
       } else {
         const parts: string[] = [];
-        if (skippedNotApproved > 0) parts.push(`${skippedNotApproved} not approved yet`);
-        if (skippedWrongContract > 0) parts.push(`${skippedWrongContract} wrong contract`);
-        if (skippedWrongChain > 0) parts.push(`${skippedWrongChain} wrong network`);
-        toast(parts.length > 0 ? `No keys imported (${parts.join(", ")})` : "No valid keys found");
+        if (skippedNotApproved > 0)
+          parts.push(`${skippedNotApproved} not approved yet`);
+        if (skippedWrongContract > 0)
+          parts.push(`${skippedWrongContract} wrong contract`);
+        if (skippedWrongChain > 0)
+          parts.push(`${skippedWrongChain} wrong network`);
+        toast(
+          parts.length > 0
+            ? `No keys imported (${parts.join(", ")})`
+            : "No valid keys found"
+        );
       }
     } catch (error: any) {
       captureError("accessCenter.fetchInboxKeys", error, { account });
@@ -427,7 +519,9 @@ const AccessCenter = () => {
     return keyStoreService.get(docId);
   };
 
-  const decryptMetadata = (doc: DocumentData): { name?: string; type?: string } | null => {
+  const decryptMetadata = (
+    doc: DocumentData
+  ): { name?: string; type?: string } | null => {
     const key = getStoredKey(doc.id);
     if (!key) return null;
     try {
@@ -500,7 +594,14 @@ const AccessCenter = () => {
         state,
       };
     });
-  }, [documents, activeAccessByDoc, latestRequestByDoc, vaultPassSet, vaults, account]);
+  }, [
+    documents,
+    activeAccessByDoc,
+    latestRequestByDoc,
+    vaultPassSet,
+    vaults,
+    account,
+  ]);
 
   const filteredRows = useMemo(() => {
     const term = search.toLowerCase().trim();
@@ -508,20 +609,31 @@ const AccessCenter = () => {
       if (hasVaultFilter && item.doc.vaultId !== selectedVaultFromQuery) {
         return false;
       }
-      if (accessibleOnly && (!item.hasChainAccess || (!item.hasVaultPass && !item.isVaultCreator))) {
+      if (
+        accessibleOnly &&
+        (!item.hasChainAccess || (!item.hasVaultPass && !item.isVaultCreator))
+      ) {
         return false;
       }
       if (!term) {
         return true;
       }
-      const vaultName = vaultNameById[item.doc.vaultId] || `Vault #${item.doc.vaultId}`;
+      const vaultName =
+        vaultNameById[item.doc.vaultId] || `Vault #${item.doc.vaultId}`;
       return (
         item.name.toLowerCase().includes(term) ||
         vaultName.toLowerCase().includes(term) ||
         item.doc.ipfsHash.toLowerCase().includes(term)
       );
     });
-  }, [rows, search, vaultNameById, hasVaultFilter, selectedVaultFromQuery, accessibleOnly]);
+  }, [
+    rows,
+    search,
+    vaultNameById,
+    hasVaultFilter,
+    selectedVaultFromQuery,
+    accessibleOnly,
+  ]);
 
   const handleRequestAccess = async (docId: number) => {
     if (!isConnected || !account) {
@@ -531,8 +643,11 @@ const AccessCenter = () => {
     }
 
     const targetDoc = documents.find((d) => d.id === docId);
-    const targetVault = targetDoc ? vaults.find((v) => v.id === targetDoc.vaultId) : null;
-    const vaultNetwork: "avalanche" | "stellar" = targetVault?.network || ecosystem;
+    const targetVault = targetDoc
+      ? vaults.find((v) => v.id === targetDoc.vaultId)
+      : null;
+    const vaultNetwork: "avalanche" | "stellar" =
+      targetVault?.network || ecosystem;
 
     if (vaultNetwork === "avalanche" && !isFujiNetwork) {
       toast.error("Please switch to Avalanche Fuji network");
@@ -547,7 +662,9 @@ const AccessCenter = () => {
         vaultNetwork
       );
       if (!hasPass) {
-        throw new Error(`Access pass token verification failed for ${vaultNetwork} network vault.`);
+        throw new Error(
+          `Access pass token verification failed for ${vaultNetwork} network vault.`
+        );
       }
 
       const requestId = await contractService.requestAccess(docId);
@@ -577,19 +694,31 @@ const AccessCenter = () => {
 
     const key = getStoredKey(doc.id);
     if (!key) {
-      throw new Error("Encryption key not found. Import the key package first.");
+      throw new Error(
+        "Encryption key not found. Import the key package first."
+      );
     }
 
-    const response = await fetchFromIPFS(doc.ipfsHash);
+    // Multi-provider fetch: IPFS gateway pool first, then Filecoin/Arweave backups.
+    // Sibling document CIDs are passed as PIR decoy candidates (used only when
+    // VITE_PIR_ENABLED is set) so a gateway operator sees a batch of real,
+    // indistinguishable requests rather than one bare fetch.
+    const decoyCids = documents
+      .filter((d) => d.id !== doc.id && d.ipfsHash)
+      .map((d) => d.ipfsHash);
+    const response = await storageProviderService.fetchDocument(doc.ipfsHash, undefined, decoyCids);
+    if (!response.body) {
+      throw new Error("Empty response received from IPFS");
+    }
 
-    const { isStreaming, stream } = await detectStreamingCiphertext(response.body);
+    const { isStreaming, stream } = await detectStreamingCiphertext(response.body as any);
     const metadata = decryptMetadata(doc);
     const name = metadata?.name || `document-${doc.id}`;
     const type = metadata?.type || "application/octet-stream";
 
-    if (isStreaming) {
+    if (isStreaming && stream) {
       const cryptoKey = await importStreamingKey(key);
-      const decrypted = decryptStream(stream, cryptoKey);
+      const decrypted = decryptStream(stream as any, cryptoKey);
       return { mode: "streaming" as const, decrypted, name, type };
     }
 
@@ -673,26 +802,76 @@ const AccessCenter = () => {
   };
 
   const stateChip = (state: AccessState) => {
-    if (state === "ready") return <Chip color="success" variant="flat" size="sm">Ready</Chip>;
-    if (state === "approved_key_missing") return <Chip color="warning" variant="flat" size="sm">Key Needed</Chip>;
-    if (state === "request_pending") return <Chip color="warning" variant="flat" size="sm">Pending</Chip>;
-    if (state === "request_rejected") return <Chip color="danger" variant="flat" size="sm">Rejected</Chip>;
-    if (state === "request_expired") return <Chip color="danger" variant="flat" size="sm">Expired</Chip>;
-    if (state === "no_pass") return <Chip color="default" variant="flat" size="sm">No Pass</Chip>;
-    return <Chip color="primary" variant="flat" size="sm">Can Request</Chip>;
+    if (state === "ready")
+      return (
+        <Chip color="success" variant="flat" size="sm">
+          Ready
+        </Chip>
+      );
+    if (state === "approved_key_missing")
+      return (
+        <Chip color="warning" variant="flat" size="sm">
+          Key Needed
+        </Chip>
+      );
+    if (state === "request_pending")
+      return (
+        <Chip color="warning" variant="flat" size="sm">
+          Pending
+        </Chip>
+      );
+    if (state === "request_rejected")
+      return (
+        <Chip color="danger" variant="flat" size="sm">
+          Rejected
+        </Chip>
+      );
+    if (state === "request_expired")
+      return (
+        <Chip color="danger" variant="flat" size="sm">
+          Expired
+        </Chip>
+      );
+    if (state === "no_pass")
+      return (
+        <Chip color="default" variant="flat" size="sm">
+          No Pass
+        </Chip>
+      );
+    return (
+      <Chip color="primary" variant="flat" size="sm">
+        Can Request
+      </Chip>
+    );
   };
 
   const inboxStatusChip = (status: InboxKeyStatus) => {
     if (status === "ready") {
-      return <Chip color="success" variant="flat" size="sm">Ready</Chip>;
+      return (
+        <Chip color="success" variant="flat" size="sm">
+          Ready
+        </Chip>
+      );
     }
     if (status === "awaiting_approval") {
-      return <Chip color="warning" variant="flat" size="sm">Awaiting Approval</Chip>;
+      return (
+        <Chip color="warning" variant="flat" size="sm">
+          Awaiting Approval
+        </Chip>
+      );
     }
     if (status === "wrong_contract") {
-      return <Chip color="danger" variant="flat" size="sm">Wrong Contract</Chip>;
+      return (
+        <Chip color="danger" variant="flat" size="sm">
+          Wrong Contract
+        </Chip>
+      );
     }
-    return <Chip color="danger" variant="flat" size="sm">Wrong Network</Chip>;
+    return (
+      <Chip color="danger" variant="flat" size="sm">
+        Wrong Network
+      </Chip>
+    );
   };
 
   if (!isConnected) {
@@ -704,9 +883,15 @@ const AccessCenter = () => {
           </div>
           <h1 className="text-3xl font-bold mb-4">Connect Your Wallet</h1>
           <p className="text-gray-400 mb-8 max-w-2xl mx-auto">
-            Connect beneficiary wallet to request and decrypt approved documents.
+            Connect beneficiary wallet to request and decrypt approved
+            documents.
           </p>
-          <Button size="lg" className={buttonClasses.primaryLg} onPress={connect} startContent={<FiKey />}>
+          <Button
+            size="lg"
+            className={buttonClasses.primaryLg}
+            onPress={connect}
+            startContent={<FiKey />}
+          >
             Connect Wallet
           </Button>
         </div>
@@ -736,7 +921,8 @@ const AccessCenter = () => {
         <div>
           <h1 className="text-3xl font-bold mb-2">My Access</h1>
           <p className="text-gray-400">
-            Beneficiary dashboard for access requests, approvals, and decryption readiness
+            Beneficiary dashboard for access requests, approvals, and decryption
+            readiness
           </p>
         </div>
         <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
@@ -766,6 +952,13 @@ const AccessCenter = () => {
           >
             Fetch Inbox Keys
           </Button>
+          <Button
+            className="w-full sm:w-auto bg-gradient-to-r from-indigo-600 to-cyan-600 text-white font-medium shadow-md hover:from-indigo-500 hover:to-cyan-500 transition-all rounded-xl"
+            startContent={<FiShield />}
+            onPress={() => setBlsModalOpen(true)}
+          >
+            Guardian BLS Key
+          </Button>
         </div>
       </div>
 
@@ -787,7 +980,9 @@ const AccessCenter = () => {
         <Card className="border border-gray-800 bg-gray-900/30 backdrop-blur-sm">
           <CardBody className="p-6">
             <p className="text-gray-400 text-sm">Ready to Open</p>
-            <p className="text-2xl font-bold mt-1">{rows.filter((r) => r.state === "ready").length}</p>
+            <p className="text-2xl font-bold mt-1">
+              {rows.filter((r) => r.state === "ready").length}
+            </p>
           </CardBody>
         </Card>
       </div>
@@ -797,7 +992,10 @@ const AccessCenter = () => {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-sm text-gray-400">Inbox Keys</p>
-              <p className="text-lg font-semibold">{inboxEnvelopeCount} envelope{inboxEnvelopeCount === 1 ? "" : "s"} found</p>
+              <p className="text-lg font-semibold">
+                {inboxEnvelopeCount} envelope
+                {inboxEnvelopeCount === 1 ? "" : "s"} found
+              </p>
             </div>
             <Button
               className={buttonClasses.outlineSm}
@@ -820,7 +1018,9 @@ const AccessCenter = () => {
                   </div>
                   <div className="flex items-center gap-2">
                     {item.issuedAt ? (
-                      <span className="text-xs text-gray-500">{new Date(item.issuedAt).toLocaleString()}</span>
+                      <span className="text-xs text-gray-500">
+                        {new Date(item.issuedAt).toLocaleString()}
+                      </span>
                     ) : null}
                     {inboxStatusChip(item.status)}
                   </div>
@@ -865,23 +1065,34 @@ const AccessCenter = () => {
               <TableColumn>REQUEST</TableColumn>
               <TableColumn>ACTIONS</TableColumn>
             </TableHeader>
-            <TableBody emptyContent={loading ? "Loading access records..." : "No documents found"}>
+            <TableBody
+              emptyContent={
+                loading ? "Loading access records..." : "No documents found"
+              }
+            >
               {filteredRows.map((item) => {
                 const latest = item.latestRequest;
                 const requestText = latest
                   ? `#${latest.requestId} • ${formatDate(latest.createdAt)}`
                   : "-";
-                const canRequest = item.state === "can_request" || item.state === "request_expired" || item.state === "request_rejected";
+                const canRequest =
+                  item.state === "can_request" ||
+                  item.state === "request_expired" ||
+                  item.state === "request_rejected";
                 const canDecrypt = item.state === "ready";
-                const isApprovedState = item.state === "ready" || item.state === "approved_key_missing";
+                const isApprovedState =
+                  item.state === "ready" ||
+                  item.state === "approved_key_missing";
                 const needsKeyImport = item.state === "approved_key_missing";
                 const requestActionLabel =
                   item.state === "request_pending"
                     ? "Pending"
                     : item.state === "no_pass"
-                        ? "Need Pass"
-                        : "Request Access";
-                const vaultName = vaultNameById[item.doc.vaultId] || `Vault #${item.doc.vaultId}`;
+                    ? "Need Pass"
+                    : "Request Access";
+                const vaultName =
+                  vaultNameById[item.doc.vaultId] ||
+                  `Vault #${item.doc.vaultId}`;
 
                 return (
                   <TableRow key={item.doc.id}>
@@ -889,7 +1100,8 @@ const AccessCenter = () => {
                       <div>
                         <p className="font-medium">{item.name}</p>
                         <p className="text-xs text-gray-400">
-                          {item.type} • uploader {shortenAddress(item.doc.uploadedBy)}
+                          {item.type} • uploader{" "}
+                          {shortenAddress(item.doc.uploadedBy)}
                         </p>
                       </div>
                     </TableCell>
@@ -902,7 +1114,9 @@ const AccessCenter = () => {
                           <Button
                             size="sm"
                             className={buttonClasses.outlineSm}
-                            isDisabled={!canRequest || requestingDocId === item.doc.id}
+                            isDisabled={
+                              !canRequest || requestingDocId === item.doc.id
+                            }
                             isLoading={requestingDocId === item.doc.id}
                             onPress={() => handleRequestAccess(item.doc.id)}
                           >
@@ -951,13 +1165,20 @@ const AccessCenter = () => {
         <div>
           <p className="font-medium text-gray-200">Flow reminder</p>
           <p className="text-gray-400">
-            Beneficiary needs vault pass NFT + guardian-approved request + key (Fetch Inbox Keys or import package).
+            Beneficiary needs vault pass NFT + guardian-approved request + key
+            (Fetch Inbox Keys or import package).
           </p>
           <p className="text-gray-500 mt-1">
-            Security mode: imported keys are cached for this browser session and cleared when the session ends.
+            Security mode: imported keys are cached for this browser session and
+            cleared when the session ends.
           </p>
         </div>
       </div>
+
+      <BLSKeyManagementModal
+        isOpen={blsModalOpen}
+        onClose={() => setBlsModalOpen(false)}
+      />
     </div>
   );
 };

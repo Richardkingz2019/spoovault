@@ -1,11 +1,12 @@
 import {
-  base64ToUint8Array,
   generateECIESKeyPairBase64,
   importECIESPublicKey,
   importECIESPrivateKey,
+  uint8ArrayToString,
+  stringToUint8Array,
 } from "../utils/crypto";
 
-import { secretsService, PBKDF2_ITERATIONS } from "./secrets.service";
+import { secretsService, PBKDF2_ITERATIONS, PBKDF2_PAYLOAD_VERSION } from "./secrets.service";
 import {
   WebAuthnError,
   authenticatePasskey,
@@ -90,7 +91,35 @@ const DB_VERSION = 1;
 const STORE_NAME = "keypairs";
 
 // In-memory session cache for unlocked private keys during the active browser session
-const sessionKeyCache = new Map<string, string>();
+const sessionKeyCache = new Map<string, Uint8Array>();
+
+const cachePrivateKey = (account: string, privateKey: string): void => {
+  sessionKeyCache.set(account, stringToUint8Array(privateKey));
+};
+
+const readCachedPrivateKey = (account: string): string | null => {
+  const cached = sessionKeyCache.get(account);
+  return cached ? uint8ArrayToString(cached) : null;
+};
+
+const wipeCachedPrivateKey = (account: string): void => {
+  const cached = sessionKeyCache.get(account);
+  if (!cached) return;
+
+  try {
+    const cryptoApi =
+      typeof globalThis !== "undefined" && globalThis.crypto
+        ? globalThis.crypto
+        : undefined;
+    if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
+      cryptoApi.getRandomValues(new Uint8Array(cached.buffer, cached.byteOffset, cached.byteLength));
+    }
+  } catch {
+    // Ignore buffer type mismatch in mock test runners
+  }
+  cached.fill(0);
+  sessionKeyCache.delete(account);
+};
 
 // Fallback in-memory store for environments without IndexedDB (e.g. Node tests without mock IDB)
 const memoryStore = new Map<string, KeyPairRecord>();
@@ -132,7 +161,7 @@ const persistKeyPair = async (
   };
 
   await idbPut(record);
-  sessionKeyCache.set(normalized, privateKey);
+  cachePrivateKey(normalized, privateKey);
 };
 
 const getEffectivePassphrase = (account: string, pinOrPassphrase?: string): { passphrase: string; isCustomPin: boolean } => {
@@ -371,19 +400,45 @@ const unlockRecord = async (
     }
   }
 
-  // Legacy (pre-ZKPP) records: PBKDF2 envelope with embedded salt.
+  // Legacy (pre-ZKPP) records: PBKDF2 or Argon2id envelope with embedded salt.
   if (!record.encryptedPrivateKey) {
     throw new Error("No decryptable key material in keyring record");
   }
   const { passphrase } = getEffectivePassphrase(normalized, pinOrPassphrase);
   try {
-    return await secretsService.decryptWithPassphrase(record.encryptedPrivateKey, passphrase);
+    const privateKey = await secretsService.decryptWithPassphrase(record.encryptedPrivateKey, passphrase);
+    await migrateLegacyPbkdf2EnvelopeIfNeeded(record, passphrase, privateKey);
+    return privateKey;
   } catch {
     throw new Error(
       record.hasPin
         ? "Incorrect PIN or passphrase. Please verify your PIN."
         : "Failed to decrypt client private key from secure storage."
     );
+  }
+};
+
+/**
+ * Migration & Backwards Compatibility (issue #74): once a legacy PBKDF2
+ * envelope has been successfully decrypted, transparently re-encrypt the
+ * private key under the memory-hard Argon2id KDF and persist it in place,
+ * so subsequent logins never touch PBKDF2 again. Best-effort only -- a
+ * migration hiccup must never fail an otherwise-successful unlock.
+ */
+const migrateLegacyPbkdf2EnvelopeIfNeeded = async (
+  record: KeyPairRecord,
+  passphrase: string,
+  privateKey: string
+): Promise<void> => {
+  try {
+    const envelope = JSON.parse(record.encryptedPrivateKey);
+    if (envelope?.version !== PBKDF2_PAYLOAD_VERSION) {
+      return;
+    }
+    const upgradedEnvelope = await secretsService.encryptWithPassphrase(privateKey, passphrase);
+    await idbPut({ ...record, encryptedPrivateKey: upgradedEnvelope, updatedAt: Date.now() });
+  } catch {
+    // Best-effort upgrade only; the caller already has a valid decrypted key.
   }
 };
 
@@ -690,9 +745,10 @@ export const clientKeyringService = {
         : null;
 
     const existing = await idbGet(normalized);
-    const updatedRecord = await persistKeyPair(normalized, publicKey, privateKey, pinOrPassphrase, existing);
+    await persistKeyPair(normalized, publicKey, privateKey, pinOrPassphrase, existing);
+    const updatedRecord = await idbGet(normalized);
 
-    if (passkey) {
+    if (passkey && updatedRecord) {
       updatedRecord.hasPasskey = true;
       updatedRecord.passkeyCredentialId = passkey.credentialId;
       updatedRecord.passkeyPrfSalt = passkey.prfSalt;
@@ -700,7 +756,7 @@ export const clientKeyringService = {
       await idbPut(updatedRecord);
     }
 
-    sessionKeyCache.set(normalized, privateKey);
+    cachePrivateKey(normalized, privateKey);
 
     return { publicKey };
   },
@@ -746,7 +802,7 @@ export const clientKeyringService = {
     }
 
     const normalized = account.toLowerCase();
-    const cached = sessionKeyCache.get(normalized);
+    const cached = readCachedPrivateKey(normalized);
     if (cached) {
       return cached;
     }
@@ -770,7 +826,7 @@ export const clientKeyringService = {
     ) {
       try {
         const privateKey = await decryptRecordWithPasskey(record);
-        sessionKeyCache.set(normalized, privateKey);
+        cachePrivateKey(normalized, privateKey);
         return privateKey;
       } catch (err) {
         const cancelled = err instanceof WebAuthnError && err.code === "NOT_ALLOWED";
@@ -791,7 +847,7 @@ export const clientKeyringService = {
     }
 
     const privateKey = await unlockRecord(record, pinOrPassphrase);
-    sessionKeyCache.set(normalized, privateKey);
+    cachePrivateKey(normalized, privateKey);
     return privateKey;
   },
 
@@ -808,7 +864,7 @@ export const clientKeyringService = {
    */
   lockAccount(account: string): void {
     if (account) {
-      sessionKeyCache.delete(account.toLowerCase());
+      wipeCachedPrivateKey(account.toLowerCase());
     }
   },
 
@@ -816,7 +872,9 @@ export const clientKeyringService = {
    * Clear all unlocked session keys from memory.
    */
   clearSessionCache(): void {
-    sessionKeyCache.clear();
+    for (const account of sessionKeyCache.keys()) {
+      wipeCachedPrivateKey(account);
+    }
   },
 
   /**
@@ -825,7 +883,7 @@ export const clientKeyringService = {
   async deleteKeyPair(account: string): Promise<void> {
     if (!account) return;
     const normalized = account.toLowerCase();
-    sessionKeyCache.delete(normalized);
+    wipeCachedPrivateKey(normalized);
     await idbDelete(normalized);
   },
 
@@ -846,10 +904,10 @@ export const clientKeyringService = {
     const privateKey = await this.getDecryptedPrivateKey(normalized, currentPin);
     const publicKey = (await this.getStoredPublicKey(normalized)) || "";
 
+    // Argon2id by default (issue #74) -- memory-hard against GPU/ASIC cracking.
     const encryptedForBackup = await secretsService.encryptWithPassphrase(
       privateKey,
-      backupPassphrase.trim(),
-      PBKDF2_ITERATIONS
+      backupPassphrase.trim()
     );
 
     const backupPayload: KeyPairBackupPayload = {
@@ -935,12 +993,15 @@ export const clientKeyringService = {
    */
   getCachedPrivateKeyBytes(account: string): Uint8Array | null {
     if (!account) return null;
-    const cached = sessionKeyCache.get(account.toLowerCase());
-    if (!cached) return null;
-    try {
-      return base64ToUint8Array(cached);
-    } catch {
-      return null;
-    }
+    return sessionKeyCache.get(account.toLowerCase()) || null;
+  },
+
+  /**
+   * Check if account has a configured BLS12-381 threshold keyring.
+   */
+  async hasBLSKey(account: string): Promise<boolean> {
+    if (!account) return false;
+    const { blsKeyringService } = await import("./blsKeyring.service");
+    return blsKeyringService.hasKeyForGuardian(account);
   },
 };

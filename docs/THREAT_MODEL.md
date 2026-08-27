@@ -22,6 +22,8 @@ This file addresses the STRIDE matrix requirement with 15+ attack vectors.
 | 15 | **Elevation of Privilege** | Unauthorized Relayer access | Role-Based Access Control (RBAC) within the Relayer network. |
 | 16 | **Cryptographic** | Weak Entropy for VSS | Using `window.crypto.getRandomValues()` for cryptographically secure randomness. |
 | 17 | **Cryptographic** | Insufficient Threshold ($t < n/2$) | Enforcing a minimum threshold of 2/3 for all vault configurations. |
+| 18 | **Spoofing / Elevation of Privilege** | Forged or replayed keeper delegation (Issue #32) | EVM: keeper authorizations require an EIP-712 signature from the vault creator, verified on-chain via `_hashTypedDataV4`/`ECDSA.recover` and bound to a per-vault nonce that invalidates any prior signature once consumed. Soroban: `authorize_keeper` requires the owner's native `require_auth`, so no signature can be forged or replayed off-chain. |
+| 19 | **Denial of Service / Repudiation** | Compromised or malicious keeper spamming/withholding heartbeats | Delegations are scoped to a single keeper address and a bounded `expiresAt`/`expires_at`; the owner can call `revokeKeeper`/`revoke_keeper` at any time, and heartbeats remain available directly from the owner's own wallet (`proveLife`/`prove_life`) regardless of keeper state. |
 
 ## Formal Security Guarantees
 - **Non-Custodial**: Neither Spoo-Vault nor the Relayer ever possesses a full recovery key.

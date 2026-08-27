@@ -18,6 +18,16 @@ pragma solidity ^0.8.20;
  */
 interface ISpooVault {
     /**
+     * @dev Emitted when a guardian registers their BLS12-381 public key and Proof of Possession.
+     */
+    event GuardianBLSKeyRegistered(uint256 indexed vaultId, address indexed guardian, bytes blsPublicKey);
+
+    /**
+     * @dev Emitted when an access request is approved via threshold BLS signature aggregation.
+     */
+    event BLSAccessApproved(uint256 indexed requestId, uint256 indexed vaultId, uint256 guardianCount, bytes aggregatedSignature);
+
+    /**
      * @dev Returns true if `interfaceId` is supported by the implementing
      *      contract (ERC-165). Implementations MUST return true for
      *      `type(ISpooVault).interfaceId` and for the standard ERC-165
@@ -72,4 +82,40 @@ interface ISpooVault {
      * @return threshold The approval threshold.
      */
     function getApprovalThreshold(uint256 vaultId) external view returns (uint256);
+
+    /**
+     * @dev Registers a BLS12-381 G1 public key and Proof of Possession for a vault guardian.
+     * @param vaultId Identifier of the vault.
+     * @param blsPublicKey 48-byte compressed G1 public key.
+     * @param proofOfPossession 96-byte compressed G2 Proof of Possession signature.
+     */
+    function registerGuardianBLSKey(
+        uint256 vaultId,
+        bytes calldata blsPublicKey,
+        bytes calldata proofOfPossession
+    ) external;
+
+    /**
+     * @dev Returns the registered BLS key information for a guardian.
+     */
+    function getGuardianBLSKey(
+        uint256 vaultId,
+        address guardian
+    ) external view returns (bytes memory blsPublicKey, bytes memory proofOfPossession, bool isRegistered);
+
+    /**
+     * @dev Approves an access request via off-chain aggregated BLS threshold signature in a single transaction.
+     * @param requestId The access request identifier.
+     * @param guardianAddresses Array of distinct active guardians who participated.
+     * @param aggregatedSignature 96-byte compressed G2 aggregated BLS signature.
+     * @param aggregatedPublicKey 48-byte compressed G1 aggregated BLS public key.
+     * @param encryptedSharesForBeneficiary Encrypted key shares submitted by each guardian for beneficiary.
+     */
+    function approveAccessBLS(
+        uint256 requestId,
+        address[] calldata guardianAddresses,
+        bytes calldata aggregatedSignature,
+        bytes calldata aggregatedPublicKey,
+        string[] calldata encryptedSharesForBeneficiary
+    ) external;
 }

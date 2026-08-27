@@ -1,0 +1,28 @@
+[package]
+name = "spoovault_stellar_upgrade_fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Test-only fixture: a minimal, independently-versioned Soroban contract
+# used exclusively as the "new version" Wasm blob in
+# `contracts-stellar/src/test.rs`'s `upgrade_contract` integration test (see
+# `contracts-stellar/upgrade_fixture/README.md`). It is never deployed and
+# is not part of the SpooVault product surface.
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "21.0.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[patch.crates-io]
+ethnum = { path = "../patches/ethnum" }

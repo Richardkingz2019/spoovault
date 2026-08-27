@@ -2,6 +2,20 @@ import { ethers } from "ethers";
 import { stellarService } from "./stellar.service";
 import { identityService } from "./identity.service";
 import { TtlCache } from "../utils/ttlCache";
+import {
+  OfflineQueuedError,
+  isNetworkFailure,
+  withOfflineFallback,
+  readDocumentsCache,
+  readInvitesCache,
+  readPublicKeyCache,
+  readVaultsCache,
+  writeDocumentsCache,
+  writeInvitesCache,
+  writePublicKeyCache,
+  writeVaultsCache,
+} from "./offline/offlineCache.service";
+import { enqueueAction } from "./offline/offlineQueue.service";
 
 export interface VaultData {
   id: number;
@@ -75,6 +89,11 @@ export interface VaultReleaseState {
   postDeathUnlocked: boolean;
 }
 
+export interface KeeperAuthorizationData {
+  keeper: string;
+  expiresAt: number;
+}
+
 const CONTRACT_ABI = [
   "function createVault(string name, string description, address[] guardians, uint256 approvalThreshold) external returns (uint256)",
   "function addDocument(uint256 vaultId, string encryptedMetadata, string ipfsHash, uint8 requiredAccess) external returns (uint256)",
@@ -83,7 +102,15 @@ const CONTRACT_ABI = [
   "function addDocumentWithReleaseCondition(uint256 vaultId, string encryptedMetadata, string ipfsHash, uint8 requiredAccess, uint8 releaseCondition, address[] guardiansList, string[] shares) external returns (uint256)",
   "function configureVaultRelease(uint256 vaultId, uint256 inactivityPeriod) external",
   "function proveLife(uint256 vaultId) external",
+  "function authorizeKeeperBySig(uint256 vaultId, address keeper, uint256 expiresAt, bytes signature) external",
+  "function revokeKeeper(uint256 vaultId) external",
+  "function proveLifeByKeeper(uint256 vaultId) external",
+  "function keeperAuthorizations(uint256 vaultId) external view returns (address keeper, uint256 expiresAt)",
+  "function keeperAuthNonces(uint256 vaultId) external view returns (uint256)",
+  "function getVaultGID(uint256 vaultId) external view returns (string)",
   "function setEmergencyMode(uint256 vaultId, bool enabled) external",
+  "function setBeneficiary(uint256 vaultId, address beneficiary) external",
+  "function getBeneficiary(uint256 vaultId) external view returns (address)",
   "function getVaultReleaseState(uint256 vaultId) external view returns (bool emergencyMode, uint256 inactivityPeriod, uint256 lastProofOfLife, bool postDeathUnlocked)",
   "function documentReleaseCondition(uint256 documentId) external view returns (uint8)",
   "function requestAccess(uint256 documentId) external returns (uint256)",
@@ -121,7 +148,20 @@ const CONTRACT_ABI = [
   "event PublicKeyRegistered(address indexed user, string publicKey)",
   "event GuardianSharesSaved(uint256 indexed documentId)",
   "event ShareSubmittedForBeneficiary(uint256 indexed requestId, address indexed guardian, string encryptedShare)",
+  "event BeneficiarySet(uint256 indexed vaultId, address indexed beneficiary)",
+  "event KeeperAuthorized(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 expiresAt)",
+  "event KeeperRevoked(uint256 indexed vaultId, address indexed owner)",
+  "event ProofOfLifeRelayed(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 timestamp)",
 ];
+
+const KEEPER_AUTHORIZATION_EIP712_TYPES = {
+  KeeperAuthorization: [
+    { name: "vaultId", type: "uint256" },
+    { name: "keeper", type: "address" },
+    { name: "expiresAt", type: "uint256" },
+    { name: "nonce", type: "uint256" },
+  ],
+};
 
 let provider: ethers.Provider | null = null;
 let fallbackProviders: ethers.JsonRpcProvider[] = [];
@@ -818,6 +858,56 @@ const approveAccess = async (requestId: number, encryptedShareForBeneficiary?: s
   await waitForReceipt(tx);
 };
 
+const registerGuardianBLSKey = async (
+  vaultId: number,
+  blsPublicKey: string,
+  proofOfPossession: string
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  const tx = await contract.registerGuardianBLSKey(vaultId, blsPublicKey, proofOfPossession);
+  await waitForReceipt(tx);
+};
+
+const getGuardianBLSKey = async (
+  vaultId: number,
+  guardian: string
+): Promise<{ blsPublicKey: string; proofOfPossession: string; isRegistered: boolean }> => {
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  try {
+    const res = await contract.getGuardianBLSKey(vaultId, guardian);
+    return {
+      blsPublicKey: res[0],
+      proofOfPossession: res[1],
+      isRegistered: Boolean(res[2]),
+    };
+  } catch {
+    return {
+      blsPublicKey: "",
+      proofOfPossession: "",
+      isRegistered: false,
+    };
+  }
+};
+
+const approveAccessBLS = async (
+  requestId: number,
+  guardianAddresses: string[],
+  aggregatedSignature: string,
+  aggregatedPublicKey: string,
+  encryptedSharesForBeneficiary: string[] = []
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  const tx = await contract.approveAccessBLS(
+    requestId,
+    guardianAddresses,
+    aggregatedSignature,
+    aggregatedPublicKey,
+    encryptedSharesForBeneficiary
+  );
+  await waitForReceipt(tx);
+};
+
 const registerPublicKey = async (publicKey: string): Promise<void> => {
   const contract = ensureWriteContract();
   const tx = await contract.registerPublicKey(publicKey);
@@ -1262,13 +1352,25 @@ const configureVaultRelease = async (
   await waitForReceipt(tx);
 };
 
-const recordProofOfLife = async (vaultId: number): Promise<void> => {
+const recordProofOfLife = async (vaultId: number): Promise<string> => {
   const contract = ensureWriteContract();
   if (!contractHasFunction(contract, "proveLife(uint256)")) {
     throw new Error("Current contract does not support proof-of-life actions.");
   }
   const tx = await contract.proveLife(vaultId);
-  await waitForReceipt(tx);
+  const receipt = await waitForReceipt(tx);
+  if (!receipt?.hash) throw new Error("Proof-of-life transaction was not confirmed");
+  return receipt.hash;
+};
+
+const getVaultGID = async (vaultId: number): Promise<string> => {
+  if (getEcosystem() === "stellar") {
+    return `stellar-testnet:${vaultId}`;
+  }
+  if (!readContract || !contractHasFunction(readContract, "getVaultGID(uint256)")) {
+    throw new Error("Cross-chain vault identity is not supported by this contract");
+  }
+  return String(await readContract.getVaultGID(vaultId));
 };
 
 const setEmergencyMode = async (vaultId: number, enabled: boolean): Promise<void> => {
@@ -1278,6 +1380,122 @@ const setEmergencyMode = async (vaultId: number, enabled: boolean): Promise<void
   }
   const tx = await contract.setEmergencyMode(vaultId, enabled);
   await waitForReceipt(tx);
+};
+
+const setBeneficiary = async (vaultId: number, beneficiary: string): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "setBeneficiary(uint256,address)")) {
+    throw new Error("Current contract does not support beneficiary notifications.");
+  }
+  const tx = await contract.setBeneficiary(vaultId, beneficiary);
+  await waitForReceipt(tx);
+};
+
+const getBeneficiary = async (vaultId: number): Promise<string> => {
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+
+  if (!contractHasFunction(contract, "getBeneficiary(uint256)")) {
+    return ethers.ZeroAddress;
+  }
+
+  try {
+    return await contract.getBeneficiary(vaultId);
+  } catch {
+    return ethers.ZeroAddress;
+  }
+};
+
+/**
+ * Vault creator signs an EIP-712 "KeeperAuthorization" message off-chain, delegating
+ * proof-of-life heartbeats for `vaultId` to `keeper` until `expiresAt`. Signing costs no
+ * gas; the returned signature is later relayed on-chain (by anyone, typically the keeper
+ * itself) via {relayKeeperAuthorization}.
+ */
+const signKeeperAuthorization = async (
+  vaultId: number,
+  keeper: string,
+  expiresAt: number
+): Promise<string> => {
+  const contract = ensureWriteContract();
+  const signer = contract.runner;
+  if (!signer || typeof (signer as ethers.Signer).signTypedData !== "function") {
+    throw new Error("A connected wallet signer is required to authorize a keeper.");
+  }
+
+  const nonce = await contract.keeperAuthNonces(vaultId);
+  const domain = {
+    name: "SpooVault",
+    version: "1",
+    chainId: getConfiguredChainId(),
+    verifyingContract: getContractAddress(),
+  };
+
+  return (signer as ethers.Signer).signTypedData(domain, KEEPER_AUTHORIZATION_EIP712_TYPES, {
+    vaultId,
+    keeper,
+    expiresAt,
+    nonce,
+  });
+};
+
+/**
+ * Submits a vault creator's signed keeper authorization on-chain. Callable by anyone —
+ * the EIP-712 signature alone proves the creator's consent — so this is typically invoked
+ * by the keeper itself when it first registers to relay a vault's heartbeats.
+ */
+const relayKeeperAuthorization = async (
+  vaultId: number,
+  keeper: string,
+  expiresAt: number,
+  signature: string
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "authorizeKeeperBySig(uint256,address,uint256,bytes)")) {
+    throw new Error("Current contract does not support keeper delegation.");
+  }
+  const tx = await contract.authorizeKeeperBySig(vaultId, keeper, expiresAt, signature);
+  await waitForReceipt(tx);
+};
+
+const revokeKeeper = async (vaultId: number): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "revokeKeeper(uint256)")) {
+    throw new Error("Current contract does not support keeper delegation.");
+  }
+  const tx = await contract.revokeKeeper(vaultId);
+  await waitForReceipt(tx);
+};
+
+/**
+ * Web3 Keeper (Chainlink Automation / Gelato) relay of a proof-of-life heartbeat,
+ * submitted using the keeper's own signer rather than the vault creator's.
+ */
+const relayProofOfLife = async (vaultId: number): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "proveLifeByKeeper(uint256)")) {
+    throw new Error("Current contract does not support keeper-relayed heartbeats.");
+  }
+  const tx = await contract.proveLifeByKeeper(vaultId);
+  await waitForReceipt(tx);
+};
+
+const getKeeperAuthorization = async (vaultId: number): Promise<KeeperAuthorizationData | null> => {
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  if (!contractHasFunction(contract, "keeperAuthorizations(uint256)")) {
+    return null;
+  }
+  try {
+    const value = await contract.keeperAuthorizations(vaultId);
+    const keeper = String(value.keeper ?? value[0]);
+    if (keeper === ethers.ZeroAddress) {
+      return null;
+    }
+    return { keeper, expiresAt: Number(value.expiresAt ?? value[1]) };
+  } catch {
+    return null;
+  }
 };
 
 const fetchPendingInvites = async (user: string): Promise<GuardianInviteData[]> => {
@@ -1623,16 +1841,41 @@ const getEcosystem = (): "avalanche" | "stellar" => {
   return (window.localStorage.getItem("spoovault-ecosystem") as "avalanche" | "stellar") || "avalanche";
 };
 
+// ---------------------------------------------------------------------------
+// Offline-first integration
+//
+// Reads fall back to the Dexie/IndexedDB cache when the network is down so
+// vault inspection keeps working; writes that fail due to connectivity are
+// persisted into the offline action queue and replayed automatically on
+// reconnect (see services/offline/replay.service.ts).
+// ---------------------------------------------------------------------------
+
 const proxiedCreateVault = async (
   name: string,
   description: string,
   guardians: string[],
   approvalThreshold: number
 ): Promise<number> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.createVault(name, description, guardians, approvalThreshold);
+  const run = async (): Promise<number> => {
+    if (getEcosystem() === "stellar") {
+      return stellarService.createVault(name, description, guardians, approvalThreshold);
+    }
+    return createVault(name, description, guardians, approvalThreshold);
+  };
+
+  try {
+    return await run();
+  } catch (error) {
+    if (isNetworkFailure(error)) {
+      await enqueueAction(
+        "create-vault",
+        { name, description, guardians, approvalThreshold },
+        { label: `Vault "${name}"` }
+      );
+      throw new OfflineQueuedError(`vault "${name}" creation`);
+    }
+    throw error;
   }
-  return createVault(name, description, guardians, approvalThreshold);
 };
 
 const proxiedAddDocument = async (
@@ -1644,25 +1887,65 @@ const proxiedAddDocument = async (
   guardiansList?: string[],
   shares?: string[]
 ): Promise<number> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.addDocument(
-      vaultId,
-      encryptedMetadata,
-      ipfsHash,
-      requiredAccess,
-      releaseCondition,
-      guardiansList,
-      shares
-    );
+  const run = async (): Promise<number> => {
+    if (getEcosystem() === "stellar") {
+      return stellarService.addDocument(
+        vaultId,
+        encryptedMetadata,
+        ipfsHash,
+        requiredAccess,
+        releaseCondition,
+        guardiansList,
+        shares
+      );
+    }
+    return addDocument(vaultId, encryptedMetadata, ipfsHash, requiredAccess, releaseCondition, guardiansList, shares);
+  };
+
+  try {
+    return await run();
+  } catch (error) {
+    if (isNetworkFailure(error)) {
+      await enqueueAction(
+        "add-document",
+        {
+          vaultId,
+          encryptedMetadata,
+          ipfsHash,
+          requiredAccess,
+          releaseCondition,
+          guardiansList,
+          shares,
+        },
+        { label: `document upload to vault #${vaultId}` }
+      );
+      throw new OfflineQueuedError("document upload");
+    }
+    throw error;
   }
-  return addDocument(vaultId, encryptedMetadata, ipfsHash, requiredAccess, releaseCondition, guardiansList, shares);
 };
 
 const proxiedRequestAccess = async (documentId: number): Promise<number> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.requestAccess(documentId);
+  const run = async (): Promise<number> => {
+    if (getEcosystem() === "stellar") {
+      return stellarService.requestAccess(documentId);
+    }
+    return requestAccess(documentId);
+  };
+
+  try {
+    return await run();
+  } catch (error) {
+    if (isNetworkFailure(error)) {
+      await enqueueAction(
+        "request-access",
+        { documentId },
+        { label: `access request for document #${documentId}` }
+      );
+      throw new OfflineQueuedError("access request");
+    }
+    throw error;
   }
-  return requestAccess(documentId);
 };
 
 const proxiedApproveAccess = async (requestId: number, encryptedShareForBeneficiary?: string): Promise<void> => {
@@ -1690,18 +1973,43 @@ const proxiedAcceptGuardianInvite = async (vaultId: number): Promise<void> => {
 const proxiedFetchVaultsForAccount = async (
   account: string,
   options?: { tokenVaultIds?: number[] }
-): Promise<VaultData[]> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.fetchVaultsForAccount(account) as unknown as Promise<VaultData[]>;
-  }
-  return fetchVaultsForAccount(account, options);
-};
+): Promise<VaultData[]> =>
+  withOfflineFallback({
+    scope: `vaults:${account}`,
+    fetchLive: async () => {
+      if (getEcosystem() === "stellar") {
+        return stellarService.fetchVaultsForAccount(account) as unknown as VaultData[];
+      }
+      return fetchVaultsForAccount(account, options);
+    },
+    readCache: () => readVaultsCache(account, getEcosystem()),
+    writeCache: (vaults) => writeVaultsCache(account, getEcosystem(), vaults),
+  });
 
-const proxiedFetchDocumentsForVaults = async (vaultIds: number[]): Promise<DocumentData[]> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.fetchDocumentsForVaults(vaultIds) as unknown as Promise<DocumentData[]>;
-  }
-  return fetchDocumentsForVaults(vaultIds);
+const proxiedFetchDocumentsForVaults = async (
+  vaultIds: number[],
+  account?: string
+): Promise<DocumentData[]> => {
+  const network = getEcosystem();
+  const owner = account ?? "";
+
+  return withOfflineFallback({
+    scope: "documents",
+    fetchLive: async () => {
+      if (network === "stellar") {
+        return stellarService.fetchDocumentsForVaults(vaultIds) as unknown as DocumentData[];
+      }
+      return fetchDocumentsForVaults(vaultIds);
+    },
+    readCache: () =>
+      owner
+        ? readDocumentsCache(owner, network)
+        : Promise.resolve([] as DocumentData[]),
+    writeCache: (documents) =>
+      owner
+        ? writeDocumentsCache(owner, network, documents)
+        : Promise.resolve(),
+  });
 };
 
 const proxiedFetchPendingApprovalsForGuardian = async (
@@ -1729,25 +2037,53 @@ const proxiedGetBeneficiaryKeyShare = async (requestId: number, guardian: string
 };
 
 const proxiedRegisterPublicKey = async (publicKey: string): Promise<void> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.registerPublicKey(publicKey);
+  const run = async (): Promise<void> => {
+    if (getEcosystem() === "stellar") {
+      return stellarService.registerPublicKey(publicKey);
+    }
+    return registerPublicKey(publicKey);
+  };
+
+  try {
+    await run();
+  } catch (error) {
+    if (isNetworkFailure(error)) {
+      await enqueueAction(
+        "register-public-key",
+        { publicKey },
+        { label: "encryption public key registration" }
+      );
+      throw new OfflineQueuedError("encryption public key registration");
+    }
+    throw error;
   }
-  return registerPublicKey(publicKey);
 };
 
-const proxiedGetUserPublicKey = async (user: string): Promise<string> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.getUserPublicKey(user);
-  }
-  return getUserPublicKey(user);
-};
+const proxiedGetUserPublicKey = async (user: string): Promise<string> =>
+  withOfflineFallback({
+    scope: `publicKey:${user}`,
+    fetchLive: async () => {
+      if (getEcosystem() === "stellar") {
+        return stellarService.getUserPublicKey(user);
+      }
+      return getUserPublicKey(user);
+    },
+    readCache: () => readPublicKeyCache(user, getEcosystem()),
+    writeCache: (publicKey) => writePublicKeyCache(user, publicKey, getEcosystem()),
+  });
 
-const proxiedFetchPendingInvites = async (account: string): Promise<any[]> => {
-  if (getEcosystem() === "stellar") {
-    return stellarService.getPendingInvites(account);
-  }
-  return fetchPendingInvites(account);
-};
+const proxiedFetchPendingInvites = async (account: string): Promise<any[]> =>
+  withOfflineFallback({
+    scope: `invites:${account}`,
+    fetchLive: async () => {
+      if (getEcosystem() === "stellar") {
+        return stellarService.getPendingInvites(account);
+      }
+      return fetchPendingInvites(account);
+    },
+    readCache: () => readInvitesCache(account, getEcosystem()),
+    writeCache: (invites) => writeInvitesCache(account, getEcosystem(), invites),
+  });
 
 const proxiedHasActiveAccess = async (documentId: number, user: string): Promise<boolean> => {
   if (getEcosystem() === "stellar") {
@@ -1858,6 +2194,53 @@ const proxiedMintAccessToken = async (
   return mintAccessToken(vaultId, to, tokenURI);
 };
 
+const proxiedRegisterGuardianBLSKey = async (
+  vaultId: number,
+  blsPublicKey: string,
+  proofOfPossession: string
+): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.registerGuardianBLSKey(vaultId, blsPublicKey, proofOfPossession);
+  }
+  return registerGuardianBLSKey(vaultId, blsPublicKey, proofOfPossession);
+};
+
+const proxiedGetGuardianBLSKey = async (
+  vaultId: number,
+  guardian: string
+): Promise<{ blsPublicKey: string; proofOfPossession: string; isRegistered: boolean }> => {
+  if (getEcosystem() === "stellar") {
+    const info = await stellarService.getGuardianBLSKey(vaultId, guardian);
+    return info || { blsPublicKey: "", proofOfPossession: "", isRegistered: false };
+  }
+  return getGuardianBLSKey(vaultId, guardian);
+};
+
+const proxiedApproveAccessBLS = async (
+  requestId: number,
+  guardianAddresses: string[],
+  aggregatedSignature: string,
+  aggregatedPublicKey: string,
+  encryptedSharesForBeneficiary: string[] = []
+): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.approveAccessBLS(
+      requestId,
+      guardianAddresses,
+      aggregatedSignature,
+      aggregatedPublicKey,
+      encryptedSharesForBeneficiary
+    );
+  }
+  return approveAccessBLS(
+    requestId,
+    guardianAddresses,
+    aggregatedSignature,
+    aggregatedPublicKey,
+    encryptedSharesForBeneficiary
+  );
+};
+
 export const contractService = {
   initialize,
   clear,
@@ -1866,6 +2249,9 @@ export const contractService = {
   addDocument: proxiedAddDocument,
   requestAccess: proxiedRequestAccess,
   approveAccess: proxiedApproveAccess,
+  registerGuardianBLSKey: proxiedRegisterGuardianBLSKey,
+  getGuardianBLSKey: proxiedGetGuardianBLSKey,
+  approveAccessBLS: proxiedApproveAccessBLS,
   acceptGuardianInvite: proxiedAcceptGuardianInvite,
   mintAccessToken: proxiedMintAccessToken,
   burnAccessToken,
@@ -1888,7 +2274,15 @@ export const contractService = {
   fetchVaultReleaseStates,
   configureVaultRelease,
   recordProofOfLife,
+  getVaultGID,
   setEmergencyMode,
+  setBeneficiary,
+  getBeneficiary,
+  signKeeperAuthorization,
+  relayKeeperAuthorization,
+  revokeKeeper,
+  relayProofOfLife,
+  getKeeperAuthorization,
   fetchPendingApprovalsForGuardian: proxiedFetchPendingApprovalsForGuardian,
   getRecentActivity,
   registerPublicKey: proxiedRegisterPublicKey,

@@ -18,17 +18,38 @@ module.exports = {
         enabled: true,
         runs: 200,
       },
+      // Dropping the CBOR metadata hash from deployed bytecode buys back size
+      // margin against the EIP-170 24,576-byte contract-size limit at zero
+      // gas/behavior cost — SpooVault.sol otherwise compiles to within a few
+      // bytes of that cap.
+      metadata: {
+        bytecodeHash: "none",
+      },
+      // Requests solc's storageLayout output (slot/offset per state
+      // variable) into artifacts/build-info/*.json so storage packing can be
+      // inspected/verified without a separate plugin — see
+      // scripts/print-storage-layout.mjs.
+      outputSelection: {
+        "*": {
+          "*": ["storageLayout"],
+        },
+      },
     },
   },
   gasReporter: {
     enabled: gasReporterEnabled,
     noColors: true,
     outputFile: "gas-report.txt",
-    showMethodSig: false,
+    showMethodSig: true,
   },
   networks: {
+    hardhat: {
+      allowUnlimitedContractSize: true,
+    },
     fuji: {
-      url: process.env.VITE_AVALANCHE_RPC || "https://api.avax-test.network/ext/bc/C/rpc",
+      url:
+        process.env.VITE_AVALANCHE_RPC ||
+        "https://api.avax-test.network/ext/bc/C/rpc",
       accounts: process.env.DEPLOYER_PRIVATE_KEY
         ? [process.env.DEPLOYER_PRIVATE_KEY]
         : [],

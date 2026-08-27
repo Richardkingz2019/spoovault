@@ -24,7 +24,10 @@ Enterprise-grade document custody app supporting both **Avalanche (EVM)** and **
 - **Zero-Knowledge Client-Side Encryption**: Documents are encrypted in the browser with TweetNaCl / AES-256 before leaving your device.
 - **Guardian Multi-Sig Approval**: Distribute access keys across trusted guardians requiring threshold approval before document release.
 - **Proof-of-Life & Dead-Man's Switch**: Configurable inactivity timers automatically release encrypted access packages to designated beneficiaries if owner heartbeat lapses.
+- **Web3 Keeper Heartbeat Relay**: Vault owners can delegate proof-of-life heartbeats to automation keepers (Chainlink Automation / Gelato) via an EIP-712 signed authorization on Avalanche or a native on-chain authorization on Soroban, so a missed personal check-in doesn't trigger a false emergency unlock. See `docs/HEARTBEAT_RELAYER.md`.
 - **IPFS Storage & Proxying**: Decoupled decentralized storage with optional serverless proxy to prevent Pinata API key exposure.
+- **Private Information Retrieval (PIR)**: Oblivious IPFS document fetching using dummy query batching and optional Tor proxy routing to prevent gateway surveillance.
+- **Real-Time Event Indexing**: High-performance Soroban contract event indexer with WebSocket real-time broadcast and exponential backoff reconnection.
 - **NFT Access Passes**: Tokenized authorization layers representing access rights to specific document vaults.
 
 ---
@@ -46,10 +49,12 @@ graph TD
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
+
 - Node.js v18+ and npm
 - MetaMask (for Avalanche Fuji) or Freighter Wallet (for Stellar)
 
 ### 2. Installation
+
 ```bash
 git clone https://github.com/spoo-vault/spoovault.git
 cd spoovault
@@ -57,7 +62,9 @@ npm install
 ```
 
 ### 3. Environment Configuration
+
 Copy `.env.example` to `.env`:
+
 ```env
 VITE_CONTRACT_ADDRESS=0x64128680775Ef626379DeF6E5c815AeA8F4707Ef
 VITE_AVALANCHE_RPC=https://api.avax-test.network/ext/bc/C/rpc
@@ -71,6 +78,7 @@ VITE_IPFS_GATEWAY=https://gateway.pinata.cloud/ipfs/
 ```
 
 ### 4. Run Development Server
+
 ```bash
 npm run dev
 ```
@@ -85,6 +93,7 @@ npm run dev
 - **Stellar Soroban Tests**: `npm run test:stellar`
 - **TypeScript Verification**: `npx tsc --noEmit`
 - **Production Bundle Check**: `npx vite build` emits named `vendor-react`, `vendor-heroui`, `vendor-ethers`, and lazy `vendor-stellar` chunks so the entry JavaScript bundle stays below the initial-load budget.
+- **Fuzzing & Property Testing**: Echidna/Medusa property fuzzing of `SpooVault.sol` and proptest/cargo-fuzz random state-sequence fuzzing of the Soroban contract — see [docs/TESTING.md](docs/TESTING.md).
 
 ---
 

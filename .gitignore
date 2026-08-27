@@ -3,6 +3,10 @@ node_modules
 /.pnp
 .pnp.js
 
+# Hardhat
+artifacts
+cache
+
 # Testing
 /coverage
 
@@ -62,4 +66,3 @@ blob-report/
 # Claude Code
 .claude
 CLAUDE.md
-

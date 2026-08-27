@@ -3,9 +3,18 @@ testLimit: 5000
 seqLen: 100
 corpusDir: "/tmp/echidna-corpus"
 coverage: false
+codeSize: 0xffffff
 # Echidna will only attempt to break `echidna_*` properties.
 format: text
 # Stop early if a property is violated.
 stopOnFail: true
 # Keep CI runtime bounded.
 timeout: 300
+cryticArgs:
+  - "--solc"
+  - "/src/solc-static-linux"
+  - "--solc-remaps"
+  - "@openzeppelin/=/src/node_modules/@openzeppelin/"
+  - "--solc-args"
+  - "--optimize --optimize-runs 200 --evm-version cancun --via-ir"
+

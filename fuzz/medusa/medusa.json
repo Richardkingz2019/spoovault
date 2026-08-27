@@ -7,8 +7,8 @@
     "shrinkLimit": 5000,
     "callSequenceLength": 64,
     "pruneFrequency": 5,
-    "corpusDirectory": "fuzz/medusa/corpus",
-    "coverageEnabled": false,
+    "corpusDirectory": "corpus",
+    "coverageEnabled": true,
     "coverageFormats": [],
     "revertReporterEnabled": false,
     "targetContracts": ["SpooVaultFuzz"],
@@ -71,10 +71,15 @@
   "compilation": {
     "platform": "crytic-compile",
     "platformConfig": {
-      "target": "fuzz/harness/SpooVaultFuzz.sol",
+      "target": "../harness/SpooVaultFuzz.sol",
       "solcVersion": "",
       "exportDirectory": "",
-      "args": []
+      "args": [
+        "--solc-remaps",
+        "@openzeppelin/=../../node_modules/@openzeppelin/",
+        "--solc-args",
+        "--optimize --optimize-runs 200 --evm-version cancun --allow-paths ../.. --via-ir"
+      ]
     }
   },
   "slither": {

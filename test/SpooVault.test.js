@@ -35,12 +35,14 @@ describe("SpooVault EVM Contract Unit Tests", function () {
       const guardians = [guardian1.address, guardian2.address];
       const threshold = 2;
 
-      const tx = await spooVault.connect(owner).createVault(
-        "Executive Vault",
-        "Confidential legal documents",
-        guardians,
-        threshold
-      );
+      const tx = await spooVault
+        .connect(owner)
+        .createVault(
+          "Executive Vault",
+          "Confidential legal documents",
+          guardians,
+          threshold
+        );
 
       await expect(tx).to.emit(spooVault, "VaultCreated");
 
@@ -60,11 +62,15 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     it("should revert if approval threshold is zero or exceeds total guardian count", async function () {
       const guardians = [guardian1.address];
       await expect(
-        spooVault.connect(owner).createVault("Invalid Threshold Vault", "Desc", guardians, 0)
+        spooVault
+          .connect(owner)
+          .createVault("Invalid Threshold Vault", "Desc", guardians, 0)
       ).to.be.revertedWithCustomError(spooVault, "InvalidApprovalThreshold");
 
       await expect(
-        spooVault.connect(owner).createVault("Over Threshold Vault", "Desc", guardians, 5)
+        spooVault
+          .connect(owner)
+          .createVault("Over Threshold Vault", "Desc", guardians, 5)
       ).to.be.revertedWithCustomError(spooVault, "InvalidApprovalThreshold");
     });
   });
@@ -72,15 +78,21 @@ describe("SpooVault EVM Contract Unit Tests", function () {
   describe("Vault Release State & Proof of Life", function () {
     it("should allow vault creator to record proof of life", async function () {
       const guardians = [guardian1.address];
-      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Inheritance Vault", "Desc", guardians, 1);
 
-      await expect(spooVault.connect(owner).proveLife(1))
-        .to.emit(spooVault, "ProofOfLifeRecorded");
+      await expect(spooVault.connect(owner).proveLife(1)).to.emit(
+        spooVault,
+        "ProofOfLifeRecorded"
+      );
     });
 
     it("should allow vault creator to toggle emergency mode", async function () {
       const guardians = [guardian1.address];
-      await spooVault.connect(owner).createVault("Emergency Vault", "Desc", guardians, 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Emergency Vault", "Desc", guardians, 1);
 
       await expect(spooVault.connect(owner).setEmergencyMode(1, true))
         .to.emit(spooVault, "EmergencyModeUpdated")
@@ -88,11 +100,53 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     });
   });
 
+  describe("Beneficiary Registry", function () {
+    beforeEach(async function () {
+      await spooVault.connect(owner).createVault("Beneficiary Vault", "Desc", [guardian1.address], 1);
+    });
+
+    it("should allow the vault creator to set a beneficiary", async function () {
+      await expect(spooVault.connect(owner).setBeneficiary(1, beneficiary.address))
+        .to.emit(spooVault, "BeneficiarySet")
+        .withArgs(1, beneficiary.address);
+
+      expect(await spooVault.getBeneficiary(1)).to.equal(beneficiary.address);
+    });
+
+    it("should default to the zero address when no beneficiary is set", async function () {
+      expect(await spooVault.getBeneficiary(1)).to.equal(ethers.ZeroAddress);
+    });
+
+    it("should revert when setting a zero-address beneficiary", async function () {
+      await expect(
+        spooVault.connect(owner).setBeneficiary(1, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(spooVault, "ZeroAddressBeneficiary");
+    });
+
+    it("should revert when a non-creator tries to set the beneficiary", async function () {
+      await expect(
+        spooVault.connect(guardian1).setBeneficiary(1, beneficiary.address)
+      ).to.be.revertedWithCustomError(spooVault, "OnlyVaultCreator");
+    });
+
+    it("should revert when the beneficiary is already set", async function () {
+      await spooVault.connect(owner).setBeneficiary(1, beneficiary.address);
+
+      await expect(
+        spooVault.connect(owner).setBeneficiary(1, guardian2.address)
+      ).to.be.revertedWithCustomError(spooVault, "BeneficiaryAlreadySet");
+    });
+  });
+
   describe("Guardian Invites", function () {
     it("should allow a guardian to accept an invite and become an active guardian", async function () {
-      await spooVault.connect(owner).createVault("Vault A", "Desc", [guardian1.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault A", "Desc", [guardian1.address], 1);
 
-      const pendingBefore = await spooVault.getPendingInvites(guardian1.address);
+      const pendingBefore = await spooVault.getPendingInvites(
+        guardian1.address
+      );
       expect(pendingBefore.length).to.equal(1);
       expect(pendingBefore[0].vaultId).to.equal(1);
       expect(pendingBefore[0].accepted).to.equal(false);
@@ -109,7 +163,9 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     });
 
     it("should revert acceptGuardianInvite for non-existent invite", async function () {
-      await spooVault.connect(owner).createVault("Vault A", "Desc", [guardian2.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault A", "Desc", [guardian2.address], 1);
 
       await expect(
         spooVault.connect(guardian1).acceptGuardianInvite(1)
@@ -117,8 +173,12 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     });
 
     it("should return pending invites for a user across multiple vaults", async function () {
-      await spooVault.connect(owner).createVault("Vault A", "Desc", [guardian1.address], 1);
-      await spooVault.connect(owner).createVault("Vault B", "Desc", [guardian1.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault A", "Desc", [guardian1.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault B", "Desc", [guardian1.address], 1);
 
       const pending = await spooVault.getPendingInvites(guardian1.address);
       expect(pending.length).to.equal(2);
@@ -127,7 +187,9 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     });
 
     it("should not include accepted invites in getPendingInvites", async function () {
-      await spooVault.connect(owner).createVault("Vault A", "Desc", [guardian1.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault A", "Desc", [guardian1.address], 1);
       await spooVault.connect(guardian1).acceptGuardianInvite(1);
 
       const pending = await spooVault.getPendingInvites(guardian1.address);
@@ -135,7 +197,9 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     });
 
     it("should revert acceptGuardianInvite for expired invite", async function () {
-      await spooVault.connect(owner).createVault("Vault A", "Desc", [guardian1.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault A", "Desc", [guardian1.address], 1);
 
       await time.increase(7 * 24 * 60 * 60 + 1);
 
@@ -145,7 +209,9 @@ describe("SpooVault EVM Contract Unit Tests", function () {
     });
 
     it("should exclude expired invites from getPendingInvites", async function () {
-      await spooVault.connect(owner).createVault("Vault A", "Desc", [guardian1.address], 1);
+      await spooVault
+        .connect(owner)
+        .createVault("Vault A", "Desc", [guardian1.address], 1);
 
       await time.increase(7 * 24 * 60 * 60 + 1);
 

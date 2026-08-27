@@ -163,7 +163,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "VaultRecord"
+                  "symbol": "Vault"
                 },
                 {
                   "u64": 1
@@ -183,7 +183,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "VaultRecord"
+                      "symbol": "Vault"
                     },
                     {
                       "u64": 1
@@ -221,6 +221,14 @@
                             },
                             "val": {
                               "u64": 0
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "last_proof_of_life_sequence"
+                            },
+                            "val": {
+                              "u32": 0
                             }
                           }
                         ]

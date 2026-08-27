@@ -1,6 +1,7 @@
 import axios from "axios";
 import { ipfsGateway } from "./ipfsGateway";
 import { signProxyRequest } from "../utils/ipfsProxySignature";
+import { pirService } from "./pir.service";
 
 const PINATA_API_URL =
   import.meta.env.VITE_IPFS_API_URL || "https://api.pinata.cloud";
@@ -11,7 +12,8 @@ const PINATA_API_SECRET = import.meta.env.VITE_PINATA_API_SECRET;
 const IPFS_PROXY_URL =
   (import.meta.env.VITE_IPFS_PROXY_URL as string | undefined)?.trim() || "";
 const PROXY_SECRET =
-  (import.meta.env.VITE_SPOOVUALT_PROXY_SECRET as string | undefined)?.trim() || "";
+  (import.meta.env.VITE_SPOOVUALT_PROXY_SECRET as string | undefined)?.trim() ||
+  "";
 
 const isConfigured = (): boolean => {
   if (IPFS_PROXY_URL) {
@@ -31,6 +33,35 @@ const getURL = (hash: string): string => ipfsGateway.getURL(hash);
 
 const fetchFile = (hash: string, init?: RequestInit): Promise<Response> =>
   ipfsGateway.fetchFile(hash, init);
+
+/**
+ * Fetch a file from IPFS using PIR (Private Information Retrieval) if enabled.
+ * This obscures which document is being fetched by batching it alongside
+ * decoy queries. Pass `decoyCids` (real, existing CIDs — e.g. sibling
+ * documents in the same vault) so the batch is genuinely indistinguishable
+ * to the gateway; without them, PIR falls back to weaker synthetic decoys.
+ * When PIR is disabled (default), this is equivalent to `fetchFile`.
+ */
+const fetchFileWithPIR = async (
+  hash: string,
+  init?: RequestInit,
+  decoyCids?: string[]
+): Promise<Response> => {
+  const pirResult = await pirService.fetchDocument(hash, init?.signal || undefined, decoyCids);
+
+  if (!pirResult.success) {
+    throw new Error(pirResult.error || "PIR fetch failed");
+  }
+  
+  // Convert ArrayBuffer back to a Response-like object
+  return new Response(pirResult.data, {
+    status: 200,
+    statusText: "OK",
+    headers: {
+      "Content-Type": "application/octet-stream",
+    },
+  });
+};
 
 const getGatewayPool = (): string[] => ipfsGateway.getGatewayPool();
 
@@ -273,12 +304,67 @@ const uploadStream = async (
   }
 };
 
+const unpin = async (hash: string, signal?: AbortSignal): Promise<boolean> => {
+  if (!hash || typeof hash !== "string" || !hash.trim()) {
+    throw new Error("IPFS hash is required for unpinning");
+  }
+
+  if (!isConfigured()) {
+    throw new Error("IPFS is not configured");
+  }
+
+  const cleanHash = hash.trim();
+
+  try {
+    if (IPFS_PROXY_URL) {
+      const path = `/api/ipfs/unpin/${encodeURIComponent(cleanHash)}`;
+      const auth = await signProxyRequest({
+        secret: getProxySecret(),
+        method: "DELETE",
+        path,
+      });
+      await axios.delete(`${IPFS_PROXY_URL}${path}`, {
+        headers: auth.headers,
+        timeout: 30000,
+        signal,
+      });
+    } else {
+      await axios.delete(
+        `${PINATA_API_URL}/pinning/unpin/${encodeURIComponent(cleanHash)}`,
+        {
+          headers: buildAuthHeaders(),
+          timeout: 30000,
+          signal,
+        }
+      );
+    }
+    return true;
+  } catch (error: any) {
+    if (error?.response?.status === 404) {
+      return true;
+    }
+    const isCanceled = error?.code === "ERR_CANCELED";
+    const isTimeout = error?.code === "ECONNABORTED";
+    const message = isCanceled
+      ? "IPFS unpin canceled."
+      : isTimeout
+      ? "IPFS unpin timed out."
+      : error?.response?.data?.error?.reason ||
+        error?.response?.data?.error ||
+        error?.message ||
+        "IPFS unpin failed";
+    throw new Error(message);
+  }
+};
+
 export const ipfsService = {
   isConfigured,
   getURL,
   fetchFile,
+  fetchFileWithPIR,
   getGatewayPool,
   uploadFile,
   uploadStream,
   createMultipartFileStream,
+  unpin,
 };

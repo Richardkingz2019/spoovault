@@ -16,6 +16,11 @@ export type StellarWalletChangeListener = (event: StellarWalletChangeEvent) => v
 
 export type StellarUnsubscribe = () => void;
 
+export interface StellarKeeperAuthorizationData {
+  keeper: string;
+  expiresAt: number;
+}
+
 const normalizeAddressValue = (value: unknown): string => {
   if (typeof value === "string") return value.trim();
   if (value && typeof (value as { address?: unknown }).address === "string") {
@@ -149,6 +154,11 @@ export interface StellarDocumentData {
   uploadedBy: string;
   uploadedAt: number;
   requiredAccess: number;
+}
+
+export interface StellarKeeperAuthorizationData {
+  keeper: string;
+  expiresAt: number;
 }
 
 export interface StellarPendingApprovalData {
@@ -744,6 +754,56 @@ const executeSorobanCall = async (
   throw new Error("Transaction polling timed out");
 };
 
+const syncProofOfLife = async (
+  vaultId: number,
+  evmVaultId: number,
+  gidHash: string,
+  evmOwner: string,
+  timestamp: number,
+  signature: string,
+  recoveryId: number,
+  relayer?: string
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+  if (relayer && relayer !== activeAccount) {
+    throw new Error("Configured relayer does not match the connected Stellar account");
+  }
+  if (!isConfigured()) {
+    throw new Error("Stellar contract is not configured for heartbeat relay");
+  }
+
+  await executeSorobanCall("sync_proof_of_life", [
+    activeAccount,
+    vaultId,
+    evmVaultId,
+    hexToBytes(gidHash),
+    hexToBytes(evmOwner),
+    timestamp,
+    hexToBytes(signature),
+    recoveryId,
+  ]);
+};
+
+const bindCrossChainHeartbeat = async (
+  vaultId: number,
+  gidHash: string,
+  evmOwner: string,
+  relayer: string
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+  if (!isConfigured()) {
+    throw new Error("Stellar contract is not configured for heartbeat binding");
+  }
+
+  await executeSorobanCall("bind_cross_chain_heartbeat", [
+    activeAccount,
+    vaultId,
+    hexToBytes(gidHash),
+    hexToBytes(evmOwner),
+    relayer,
+  ]);
+};
+
 const createVault = async (
   name: string,
   description: string,
@@ -964,6 +1024,98 @@ const approveAccess = async (requestId: number, encryptedShareForBeneficiary?: s
   saveMockStorage("requests", requests);
 };
 
+const registerGuardianBLSKey = async (
+  vaultId: number,
+  blsPublicKey: string,
+  proofOfPossession: string
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    try {
+      await executeSorobanCall("register_guardian_bls_key", [
+        activeAccount,
+        vaultId,
+        hexToBytes(blsPublicKey),
+        hexToBytes(proofOfPossession),
+      ]);
+      return;
+    } catch (err) {
+      console.error("Soroban register_guardian_bls_key failed:", err);
+      throw err;
+    }
+  }
+
+  const blsKeys = getMockStorage<Record<string, { publicKey: string; proofOfPossession: string; registered: boolean }>>("stellar_bls_keys", {});
+  const keyIdentifier = `${vaultId}_${activeAccount.toLowerCase()}`;
+  blsKeys[keyIdentifier] = {
+    publicKey: blsPublicKey,
+    proofOfPossession,
+    registered: true,
+  };
+  saveMockStorage("stellar_bls_keys", blsKeys);
+};
+
+const getGuardianBLSKey = async (
+  vaultId: number,
+  guardianAddress: string
+): Promise<{ blsPublicKey: string; proofOfPossession: string; isRegistered: boolean } | null> => {
+  const blsKeys = getMockStorage<Record<string, { publicKey: string; proofOfPossession: string; registered: boolean }>>("stellar_bls_keys", {});
+  const keyIdentifier = `${vaultId}_${guardianAddress.toLowerCase()}`;
+  const info = blsKeys[keyIdentifier];
+  if (!info) return null;
+  return {
+    blsPublicKey: info.publicKey,
+    proofOfPossession: info.proofOfPossession,
+    isRegistered: info.registered,
+  };
+};
+
+const approveAccessBLS = async (
+  requestId: number,
+  guardianAddresses: string[],
+  aggregatedSignature: string,
+  aggregatedPublicKey: string,
+  encryptedShares: string[] = []
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    try {
+      await executeSorobanCall("approve_access_bls", [
+        requestId,
+        guardianAddresses,
+        hexToBytes(aggregatedSignature),
+        hexToBytes(aggregatedPublicKey),
+        encryptedShares,
+      ]);
+      return;
+    } catch (err) {
+      console.error("Soroban approve_access_bls failed:", err);
+      throw err;
+    }
+  }
+
+  const requests = getMockStorage<MockRequest[]>("requests", []);
+  const reqIdx = requests.findIndex((r) => r.requestId === requestId);
+  if (reqIdx === -1) throw new Error("Request not found");
+
+  const req = requests[reqIdx];
+  for (let i = 0; i < guardianAddresses.length; i++) {
+    const guardian = guardianAddresses[i];
+    if (!req.approvedBy.includes(guardian)) {
+      req.approvedBy.push(guardian);
+    }
+    if (i < encryptedShares.length && encryptedShares[i]) {
+      req.beneficiaryShares[guardian] = encryptedShares[i];
+    }
+  }
+
+  req.status = 1; // Approved
+  requests[reqIdx] = req;
+  saveMockStorage("requests", requests);
+};
+
 const fetchPendingApprovalsForGuardian = async (
   guardianAddress: string
 ): Promise<StellarPendingApprovalData[]> => {
@@ -1146,8 +1298,10 @@ const mintAccessToken = async (
   tokenURI: string
 ): Promise<number> => {
   if (isConfigured()) {
+    if (!activeAccount) throw new Error("Wallet not connected");
     try {
       const tokenId = await executeSorobanCall("mint_access_token", [
+        activeAccount,
         vaultId,
         to,
         tokenURI
@@ -1171,6 +1325,108 @@ const mintAccessToken = async (
   tokens.push(newToken);
   saveMockStorage("tokens", tokens);
   return nextId;
+};
+
+interface MockKeeperAuthorization {
+  keeper: string;
+  expiresAt: number;
+}
+
+/**
+ * Authorize a Web3 Keeper (Chainlink Automation / Gelato) to relay proof-of-life
+ * heartbeats for `vaultId` until `expiresAt`. Soroban's native `require_auth`
+ * already separates who authorizes an action from who submits/pays for the
+ * transaction, so — unlike the EVM side — this needs no off-chain signature
+ * scheme of its own: it's a normal owner-signed contract call.
+ */
+const authorizeKeeper = async (
+  vaultId: number,
+  keeper: string,
+  expiresAt: number
+): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    try {
+      await executeSorobanCall("authorize_keeper", [activeAccount, vaultId, keeper, expiresAt]);
+      return;
+    } catch (err) {
+      console.error("Soroban authorize_keeper failed:", err);
+      throw err;
+    }
+  }
+
+  const authorizations = getMockStorage<Record<number, MockKeeperAuthorization>>(
+    "keeper_authorizations",
+    {}
+  );
+  authorizations[vaultId] = { keeper, expiresAt };
+  saveMockStorage("keeper_authorizations", authorizations);
+};
+
+const revokeKeeperAuthorization = async (vaultId: number): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    try {
+      await executeSorobanCall("revoke_keeper", [activeAccount, vaultId]);
+      return;
+    } catch (err) {
+      console.error("Soroban revoke_keeper failed:", err);
+      throw err;
+    }
+  }
+
+  const authorizations = getMockStorage<Record<number, MockKeeperAuthorization>>(
+    "keeper_authorizations",
+    {}
+  );
+  delete authorizations[vaultId];
+  saveMockStorage("keeper_authorizations", authorizations);
+};
+
+const getKeeperAuthorization = async (
+  vaultId: number
+): Promise<StellarKeeperAuthorizationData | null> => {
+  if (isConfigured()) {
+    try {
+      const result = await executeSorobanQuery("get_keeper_authorization", [vaultId]);
+      if (!result) return null;
+      return {
+        keeper: String(result.keeper ?? result[0]),
+        expiresAt: Number(result.expires_at ?? result[1]),
+      };
+    } catch (err) {
+      console.error("Soroban get_keeper_authorization failed:", err);
+      return null;
+    }
+  }
+
+  const authorizations = getMockStorage<Record<number, MockKeeperAuthorization>>(
+    "keeper_authorizations",
+    {}
+  );
+  return authorizations[vaultId] || null;
+};
+
+/**
+ * Web3 Keeper relay of a proof-of-life heartbeat, submitted using the keeper's
+ * own connected account as both the transaction source and the `require_auth`
+ * signer — gated by a prior {authorizeKeeper} grant on-chain.
+ */
+const relayProofOfLifeAsKeeper = async (vaultId: number): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (!isConfigured()) {
+    throw new Error("Proof-of-life relay requires a configured Soroban contract.");
+  }
+
+  try {
+    await executeSorobanCall("prove_life_by_keeper", [activeAccount, vaultId]);
+  } catch (err) {
+    console.error("Soroban prove_life_by_keeper failed:", err);
+    throw err;
+  }
 };
 
 const saveCrossChainBindingMock = (
@@ -1426,6 +1682,9 @@ export const stellarService = {
   fetchDocumentsForVaults,
   requestAccess,
   approveAccess,
+  registerGuardianBLSKey,
+  getGuardianBLSKey,
+  approveAccessBLS,
   fetchPendingApprovalsForGuardian,
   getEncryptedGuardianShare,
   getBeneficiaryKeyShare,
@@ -1440,14 +1699,21 @@ export const stellarService = {
   resolveEvmToStellar,
   resolveStellarToEvm,
   resolveEvmToPublicKey,
+  authorizeKeeper,
+  revokeKeeperAuthorization,
+  getKeeperAuthorization,
+  relayProofOfLifeAsKeeper,
   buildIdentityBindingMessageHash,
   signIdentityBindingWithMetaMask,
   signIdentityBindingWithFreighter,
   bindIdentity,
+  syncProofOfLife,
+  bindCrossChainHeartbeat,
   getIdentityRegistryContractId,
   isConfigured,
   setMockStellarSdk,
   setMockFreighter,
+  invokeSorobanContract: executeSorobanCall,
 };
 
 declare global {

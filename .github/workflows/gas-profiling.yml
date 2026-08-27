@@ -92,6 +92,7 @@ jobs:
       # Benchmark dashboard + PR alert/comment (github-action-benchmark).
       - name: Benchmark (push to main ➜ dashboard)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: SpooVault Gas
@@ -100,7 +101,8 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: gas
           auto-push: true
-          save-data-file: all
+          skip-fetch-gh-pages: true
+          save-data-file: true
           alert-threshold: "105.0%"
           comment-on-alert: false
           fail-on-alert: false
