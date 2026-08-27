@@ -8,31 +8,6 @@ import "./interfaces/IEntryPoint.sol";
 
 interface ISpooVaultForPaymaster {
     function getVaultCreator(uint256 vaultId) external view returns (address);
-
-    function documents(uint256 documentId)
-        external
-        view
-        returns (
-            uint64 id,
-            uint64 vaultId,
-            string memory encryptedMetadata,
-            string memory ipfsHash,
-            address uploadedBy,
-            uint40 uploadedAt,
-            uint8 requiredAccess
-        );
-
-    function accessRequests(uint256 requestId)
-        external
-        view
-        returns (
-            uint256 requestIdVal,
-            uint256 documentId,
-            address requester,
-            uint8 status,
-            uint256 expiresAt,
-            uint256 createdAt
-        );
 }
 
 /**
@@ -106,13 +81,17 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
     error ZeroAmount();
     error Unauthorized();
     error InsufficientBalance();
+    error ZeroAddress();
 
     // ─── Constructor ─────────────────────────────────────────────────────────
     constructor(
         IEntryPoint _entryPoint,
         address _spooVault,
-        address _initialOwner
-    ) Ownable(_initialOwner) {
+        address initialOwner
+    ) Ownable(initialOwner) {
+        if (address(_entryPoint) == address(0) || _spooVault == address(0)) {
+            revert ZeroAddress();
+        }
         entryPoint = _entryPoint;
         spooVault = _spooVault;
     }
@@ -210,7 +189,7 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
         _enforceRateLimits(userOp.sender, vaultId);
 
         // Verify sponsorship balance
-        bool isVaultBalance;
+        bool isVaultBalance = false;
         if (vaultSponsorBalances[vaultId] >= maxCost) {
             isVaultBalance = true;
         } else if (creatorSponsorBalances[creator] >= maxCost) {
@@ -270,9 +249,11 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
             if (innerData.length < 4) revert InvalidCallData();
             selector = bytes4(innerData);
             if (innerData.length >= 36) {
-                assembly {
-                    param := mload(add(innerData, 36))
+                bytes memory paramBytes = new bytes(32);
+                for (uint256 i = 0; i < 32; i++) {
+                    paramBytes[i] = innerData[4 + i];
                 }
+                param = abi.decode(paramBytes, (uint256));
             }
         } else {
             target = spooVault;
@@ -292,17 +273,21 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
             vaultId = param;
         } else if (selector == APPROVE_ACCESS_SELECTOR || selector == APPROVE_ACCESS_ENCRYPTED_SELECTOR) {
             uint256 requestId = param;
-            try ISpooVaultForPaymaster(spooVault).accessRequests(requestId) returns (
-                uint256, uint256 documentId, address, uint8, uint256, uint256
-            ) {
+            (bool successReq, bytes memory reqData) = spooVault.staticcall(
+                abi.encodeWithSignature("accessRequests(uint256)", requestId)
+            );
+            if (successReq && reqData.length >= 64) {
+                (, uint256 documentId) = abi.decode(reqData, (uint256, uint256));
                 if (documentId > 0) {
-                    try ISpooVaultForPaymaster(spooVault).documents(documentId) returns (
-                        uint64, uint64 docVaultId, string memory, string memory, address, uint40, uint8
-                    ) {
+                    (bool successDoc, bytes memory docData) = spooVault.staticcall(
+                        abi.encodeWithSignature("documents(uint256)", documentId)
+                    );
+                    if (successDoc && docData.length >= 64) {
+                        (, uint64 docVaultId) = abi.decode(docData, (uint64, uint64));
                         vaultId = uint256(docVaultId);
-                    } catch {}
+                    }
                 }
-            } catch {}
+            }
 
             if (vaultId == 0 && paymasterAndData.length >= 52) {
                 vaultId = abi.decode(paymasterAndData[20:52], (uint256));
@@ -337,19 +322,20 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
     // ─── Admin Configuration ─────────────────────────────────────────────────
 
     function setRateLimits(
-        uint256 _maxOpsPerWindow,
-        uint256 _rateLimitWindow,
-        uint256 _maxVaultOpsPerWindow
+        uint256 newMaxOpsPerWindow,
+        uint256 newRateLimitWindow,
+        uint256 newMaxVaultOpsPerWindow
     ) external onlyOwner {
-        maxOpsPerWindow = _maxOpsPerWindow;
-        rateLimitWindow = _rateLimitWindow;
-        maxVaultOpsPerWindow = _maxVaultOpsPerWindow;
-        emit RateLimitsUpdated(_maxOpsPerWindow, _rateLimitWindow, _maxVaultOpsPerWindow);
+        maxOpsPerWindow = newMaxOpsPerWindow;
+        rateLimitWindow = newRateLimitWindow;
+        maxVaultOpsPerWindow = newMaxVaultOpsPerWindow;
+        emit RateLimitsUpdated(newMaxOpsPerWindow, newRateLimitWindow, newMaxVaultOpsPerWindow);
     }
 
-    function setSpooVault(address _spooVault) external onlyOwner {
-        spooVault = _spooVault;
-        emit SpooVaultUpdated(_spooVault);
+    function setSpooVault(address newSpooVault) external onlyOwner {
+        if (newSpooVault == address(0)) revert ZeroAddress();
+        spooVault = newSpooVault;
+        emit SpooVaultUpdated(newSpooVault);
     }
 
     function addStake(uint32 unstakeDelaySec) external payable onlyOwner {

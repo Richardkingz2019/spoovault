@@ -3,27 +3,37 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../interfaces/IEntryPoint.sol";
 
 /**
  * @title MockSmartAccount
  * @notice Minimal ERC-4337 smart contract account representing a guardian with 0 AVAX balance.
  */
-contract MockSmartAccount {
+contract MockSmartAccount is ReentrancyGuard {
     using ECDSA for bytes32;
     using MessageHashUtils for bytes32;
 
-    address public owner;
+    address public immutable owner;
     IEntryPoint public immutable entryPoint;
 
     event Executed(address indexed target, uint256 value, bytes data);
 
+    error UnauthorizedCaller();
+    error ExecutionFailed();
+    error ZeroAddress();
+
     modifier onlyEntryPointOrOwner() {
-        require(msg.sender == address(entryPoint) || msg.sender == owner, "account: unauthorized");
+        if (msg.sender != address(entryPoint) && msg.sender != owner) {
+            revert UnauthorizedCaller();
+        }
         _;
     }
 
     constructor(IEntryPoint _entryPoint, address _owner) {
+        if (address(_entryPoint) == address(0) || _owner == address(0)) {
+            revert ZeroAddress();
+        }
         entryPoint = _entryPoint;
         owner = _owner;
     }
@@ -34,15 +44,15 @@ contract MockSmartAccount {
         address dest,
         uint256 value,
         bytes calldata func
-    ) external onlyEntryPointOrOwner returns (bytes memory result) {
+    ) external onlyEntryPointOrOwner nonReentrant returns (bytes memory result) {
+        if (dest == address(0)) revert ZeroAddress();
+        emit Executed(dest, value, func);
+
         bool success;
         (success, result) = dest.call{value: value}(func);
         if (!success) {
-            assembly {
-                revert(add(result, 32), mload(result))
-            }
+            revert ExecutionFailed();
         }
-        emit Executed(dest, value, func);
     }
 
     function validateUserOp(
@@ -50,7 +60,7 @@ contract MockSmartAccount {
         bytes32 userOpHash,
         uint256 missingAccountFunds
     ) external returns (uint256 validationData) {
-        require(msg.sender == address(entryPoint), "account: not entrypoint");
+        if (msg.sender != address(entryPoint)) revert UnauthorizedCaller();
 
         bytes32 ethHash = userOpHash.toEthSignedMessageHash();
         address recovered = ethHash.recover(userOp.signature);
@@ -60,7 +70,7 @@ contract MockSmartAccount {
 
         if (missingAccountFunds > 0) {
             (bool success, ) = payable(msg.sender).call{value: missingAccountFunds}("");
-            (success);
+            require(success, "funds transfer failed");
         }
 
         return 0; // success

@@ -104,7 +104,6 @@ const entityKey = (...parts: Array<string | number>): string =>
 
 let dbInstancePromise: Promise<IDBPDatabase<SpooVaultDBSchema>> | null = null;
 let injectedFactory: IDBFactory | null = null;
-let injectedKeyRange: unknown = null;
 
 const memoryVaults = new Map<string, CachedVault>();
 const memoryDocuments = new Map<string, CachedDocument>();
@@ -151,12 +150,10 @@ const getDb = async (): Promise<IDBPDatabase<SpooVaultDBSchema> | null> => {
 
 export const __setOfflineDbFactoryForTests = (
   factory: IDBFactory | null,
-  idbKeyRange?: unknown
+  _idbKeyRange?: unknown
 ): void => {
   dbInstancePromise = null;
   injectedFactory = factory;
-  injectedKeyRange = idbKeyRange;
-  void injectedKeyRange;
   memoryVaults.clear();
   memoryDocuments.clear();
   memoryInvites.length = 0;
