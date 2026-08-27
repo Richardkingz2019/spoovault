@@ -297,6 +297,7 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
 
     function _enforceRateLimits(address guardian, uint256 vaultId) internal {
         // Guardian rate limit
+        // slither-disable-next-line timestamp
         if (block.timestamp >= guardianWindowStart[guardian] + rateLimitWindow) {
             guardianWindowStart[guardian] = block.timestamp;
             guardianOpCount[guardian] = 1;
@@ -308,6 +309,7 @@ contract SpooPaymaster is IPaymaster, Ownable, ReentrancyGuard {
         }
 
         // Vault rate limit
+        // slither-disable-next-line timestamp
         if (block.timestamp >= vaultWindowStart[vaultId] + rateLimitWindow) {
             vaultWindowStart[vaultId] = block.timestamp;
             vaultOpCount[vaultId] = 1;

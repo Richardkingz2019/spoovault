@@ -73,6 +73,7 @@ contract MockEntryPoint is IEntryPoint, ReentrancyGuard {
         if (block.timestamp < info.withdrawTime) revert StakeLocked();
         uint256 amount = info.stake;
         info.stake = 0;
+        // slither-disable-next-line low-level-calls
         (bool s, ) = withdrawAddress.call{value: amount}("");
         if (!s) revert TransferFailed();
     }
@@ -81,6 +82,7 @@ contract MockEntryPoint is IEntryPoint, ReentrancyGuard {
         if (withdrawAddress == address(0)) revert ZeroAddress();
         if (_deposits[msg.sender] < withdrawAmount) revert InsufficientDeposit();
         _deposits[msg.sender] -= withdrawAmount;
+        // slither-disable-next-line low-level-calls
         (bool s, ) = withdrawAddress.call{value: withdrawAmount}("");
         if (!s) revert TransferFailed();
         emit Withdrawn(msg.sender, withdrawAddress, withdrawAmount);
@@ -147,6 +149,7 @@ contract MockEntryPoint is IEntryPoint, ReentrancyGuard {
 
             // Execute the operation
             uint256 gasLimit = op.callGasLimit > 0 ? op.callGasLimit : 500_000;
+            // slither-disable-next-line low-level-calls
             (bool success, ) = op.sender.call{gas: gasLimit}(op.callData);
 
             if (paymasterAddress != address(0)) {

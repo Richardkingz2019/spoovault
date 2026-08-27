@@ -49,6 +49,7 @@ contract MockSmartAccount is ReentrancyGuard {
         emit Executed(dest, value, func);
 
         bool success;
+        // slither-disable-next-line low-level-calls
         (success, result) = dest.call{value: value}(func);
         if (!success) {
             revert ExecutionFailed();
@@ -69,6 +70,7 @@ contract MockSmartAccount is ReentrancyGuard {
         }
 
         if (missingAccountFunds > 0) {
+            // slither-disable-next-line low-level-calls
             (bool success, ) = payable(msg.sender).call{value: missingAccountFunds}("");
             require(success, "funds transfer failed");
         }
