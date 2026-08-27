@@ -155,6 +155,8 @@ export const __setOfflineDbFactoryForTests = (
 ): void => {
   dbInstancePromise = null;
   injectedFactory = factory;
+  injectedKeyRange = idbKeyRange;
+  void injectedKeyRange;
   memoryVaults.clear();
   memoryDocuments.clear();
   memoryInvites.length = 0;
