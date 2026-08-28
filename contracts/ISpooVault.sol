@@ -28,6 +28,21 @@ interface ISpooVault {
     event BLSAccessApproved(uint256 indexed requestId, uint256 indexed vaultId, uint256 guardianCount, bytes aggregatedSignature);
 
     /**
+     * @dev Emitted when a guardian revokes an off-chain delegation nonce.
+     */
+    event DelegationRevoked(address indexed guardian, uint256 indexed nonce);
+
+    /**
+     * @dev Emitted when a document's Feldmann VSS polynomial commitments are updated.
+     */
+    event VSSCommitmentsUpdated(uint256 indexed documentId, uint256 indexed epoch, bytes32[] commitments);
+
+    /**
+     * @dev Emitted when a delegate submits an approval on behalf of a guardian.
+     */
+    event DelegatedApprovalSubmitted(uint256 indexed requestId, address indexed guardian, address indexed delegate);
+
+    /**
      * @dev Returns true if `interfaceId` is supported by the implementing
      *      contract (ERC-165). Implementations MUST return true for
      *      `type(ISpooVault).interfaceId` and for the standard ERC-165
@@ -118,4 +133,28 @@ interface ISpooVault {
         bytes calldata aggregatedPublicKey,
         string[] calldata encryptedSharesForBeneficiary
     ) external;
+
+    /**
+     * @dev Verifies an EIP-712 typed data guardian delegation signature.
+     */
+    function verifyDelegation(
+        address guardian,
+        address delegate,
+        uint256 vaultId,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) external view returns (bool);
+
+    /**
+     * @dev Instantly revokes an off-chain EIP-712 delegation nonce for the caller.
+     */
+    function revokeDelegation(uint256 nonce) external;
+
+    /**
+     * @dev Returns the current active Feldmann VSS polynomial coefficient commitments for a document.
+     * @param documentId The identifier of the document.
+     * @return commitments The array of coefficient commitments [C_0, C_1, ..., C_{k-1}].
+     */
+    function getDocumentVSSCommitments(uint256 documentId) external view returns (bytes32[] memory);
 }

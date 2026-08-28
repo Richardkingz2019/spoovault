@@ -10,6 +10,10 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
+#[cfg(test)]
+extern crate std;
+
+pub mod threshold_sig;
 pub mod bls;
 pub use bls::{BLSVerifier, GuardianBLSKeyInfo};
 
@@ -1048,6 +1052,114 @@ impl SpooVaultStellar {
         Self::bump_persistent(&env, &req_key);
     }
 
+    /// Verify a batch of K-of-N Ed25519 threshold signatures in a single Soroban contract invocation
+    pub fn verify_threshold_signatures(
+        env: Env,
+        message: Bytes,
+        signatures: Vec<BytesN<64>>,
+        public_keys: Vec<BytesN<32>>,
+        threshold: u32,
+        nonce: u64,
+        expiration_ledger: u32,
+    ) -> bool {
+        Self::bump_instance(&env);
+        threshold_sig::verify_threshold_signatures_internal(
+            &env,
+            &message,
+            &signatures,
+            &public_keys,
+            threshold,
+            nonce,
+            expiration_ledger,
+        )
+    }
+
+    /// Approve an access request using batch K-of-N Ed25519 threshold signatures in a single transaction call
+    pub fn approve_access_threshold(
+        env: Env,
+        caller: Address,
+        request_id: u64,
+        signatures: Vec<BytesN<64>>,
+        public_keys: Vec<BytesN<32>>,
+        nonce: u64,
+        expiration_ledger: u32,
+        beneficiary_share: Option<String>,
+    ) {
+        caller.require_auth();
+        Self::bump_instance(&env);
+
+        let req_key = DataKey::Request(request_id);
+        let mut request: AccessRequest = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .expect("Request not found");
+        assert!(
+            request.status == RequestStatus::Pending,
+            "Request not pending"
+        );
+        assert!(
+            env.ledger().timestamp() < request.expires_at,
+            "Request expired"
+        );
+
+        let doc_key = DataKey::Doc(request.document_id);
+        let doc: Document = env
+            .storage()
+            .persistent()
+            .get(&doc_key)
+            .expect("Document not found");
+
+        let record = Self::load_vault_record(&env, doc.vault_id);
+        assert!(record.vault.is_active, "Vault is deactivated");
+
+        // Construct message committing to the request_id and document_id
+        let mut msg_bytes = Bytes::new(&env);
+        msg_bytes.extend_from_slice(b"ApproveAccess:");
+        msg_bytes.extend_from_slice(&request_id.to_be_bytes());
+        msg_bytes.extend_from_slice(&doc.vault_id.to_be_bytes());
+
+        // Verify threshold signatures against the approval threshold
+        let verified = threshold_sig::verify_threshold_signatures_internal(
+            &env,
+            &msg_bytes,
+            &signatures,
+            &public_keys,
+            record.vault.approval_threshold,
+            nonce,
+            expiration_ledger,
+        );
+        assert!(verified, "Threshold verification failed");
+
+        if let Some(share) = beneficiary_share {
+            let bshare_key = DataKey::BShare(request_id, caller);
+            env.storage().persistent().set(&bshare_key, &share);
+            Self::bump_persistent(&env, &bshare_key);
+        }
+
+        request.status = RequestStatus::Approved;
+        let acc_key = DataKey::HasAccess(request.document_id, request.requester.clone());
+        let lvl_key = DataKey::AccessLvl(request.document_id, request.requester.clone());
+        env.storage().persistent().set(&acc_key, &true);
+        env.storage().persistent().set(&lvl_key, &doc.required_access);
+        Self::bump_persistent(&env, &acc_key);
+        Self::bump_persistent(&env, &lvl_key);
+
+        let registry_key = DataKey::AccessRegistry(doc.vault_id);
+        if let Some(registry) = env.storage().persistent().get::<_, Address>(&registry_key) {
+            Self::bump_persistent(&env, &registry_key);
+            Self::notify_access_registry(
+                &env,
+                &registry,
+                request.document_id,
+                &request.requester,
+            );
+        }
+
+        env.storage().persistent().set(&req_key, &request);
+        Self::bump_persistent(&env, &req_key);
+    }
+
     /// Register BLS12-381 G1 public key with Proof of Possession for a vault guardian
     pub fn register_guardian_bls_key(
         env: Env,
@@ -1442,6 +1554,11 @@ impl SpooVaultStellar {
         record.release_state.last_proof_of_life = env.ledger().timestamp();
         record.release_state.last_proof_of_life_sequence = env.ledger().sequence();
         Self::save_vault_record(&env, vault_id, &record);
+        
+        env.events().publish(
+            (Symbol::new(&env, "prove_life"), vault_id),
+            (owner, env.ledger().timestamp()),
+        );
     }
 
     /// Authorize a Web3 Keeper (Chainlink Automation / Gelato) to relay proof-of-life
@@ -1681,6 +1798,11 @@ impl SpooVaultStellar {
 
         record.release_state.emergency_mode = enabled;
         Self::save_vault_record(&env, vault_id, &record);
+        
+        env.events().publish(
+            (Symbol::new(&env, "emergency_mode"), vault_id),
+            enabled,
+        );
     }
 
     /// Configure an optional external registry contract to be notified whenever
@@ -2430,8 +2552,6 @@ mod test;
 mod fuzz_test;
 
 
-#![no_std]
-use soroban_sdk::{contract, contractimpl, Address, Env, Bytes};
 
 #[contract]
 pub struct FheVaultContract;
@@ -2446,12 +2566,12 @@ impl FheVaultContract {
         let mut accumulator: Bytes = storage.get(&vault_id).unwrap_or_else(|| Bytes::from_array(&env, &[0u8; 32]));
 
         // Perform homomorphic addition over ciphertext bytes
-        accumulator = Self.homomorphic_add(&env, &accumulator, &encrypted_share);
+        accumulator = Self::homomorphic_add(&env, &accumulator, &encrypted_share);
 
         storage.set(&vault_id, &accumulator);
     }
 
-    fn homomorphic_add(_env: &Env, base: &Bytes, incoming: &Bytes) -> Bytes {
+    fn homomorphic_add(_env: &Env, base: &Bytes, _incoming: &Bytes) -> Bytes {
         // TFHE-rs homomorphic ciphertext addition stub over byte vectors
         base.clone()
     }

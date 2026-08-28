@@ -164,12 +164,12 @@ self.onmessage = async (event: MessageEvent<{ type: string; buffer: ArrayBuffer 
       const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
 
       // Return resulting ArrayBuffer back to main thread via zero-copy transfer
-      self.postMessage(
+      (self as any).postMessage(
         { status: 'SUCCESS', hash: hashBuffer },
         [hashBuffer]
       );
     } catch (error: any) {
-      self.postMessage({ status: 'ERROR', message: error.message });
+      (self as any).postMessage({ status: 'ERROR', message: error.message });
     }
   }
 };

@@ -2,7 +2,6 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -12,6 +11,26 @@ import "./interfaces/IVRFCoordinatorV2Plus.sol";
 import "./libs/FHEEngine.sol";
 import "./libs/BLSVerifier.sol";
 
+/// @title ReentrancyGuardTransient — Universal storage re-entrancy lock with view protection
+/// @notice Provides nonReentrant mutative protection and nonReentrantView read-only protection.
+abstract contract ReentrancyGuardTransient {
+    uint256 private _reentrancyStatus;
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    modifier nonReentrant() {
+        require(_reentrancyStatus != ENTERED, "ReentrancyGuard: reentrant call");
+        _reentrancyStatus = ENTERED;
+        _;
+        _reentrancyStatus = NOT_ENTERED;
+    }
+
+    modifier nonReentrantView() {
+        require(_reentrancyStatus != ENTERED, "ReentrancyGuard: reentrant view call");
+        _;
+    }
+}
+
 /**
  * @title SpooVault
  * @dev NFT-powered multi-signature encrypted document vault.
@@ -19,7 +38,7 @@ import "./libs/BLSVerifier.sol";
  *      document access delegations through a standardized, ERC-165 discoverable
  *      interface.
  */
-contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
+contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     using Strings for uint256;
     uint256 private _tokenIdCounter;
     uint256 private _vaultIdCounter;
@@ -108,12 +127,13 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
     // Never returned as a raw struct externally (`getVaultReleaseState`
     // manually rebuilds its own return tuple), so free to reorder: all four
-    // fields pack into a single slot.
+    // fields pack into a single slot. `targetBlocks` occupies its own slot.
     struct VaultReleaseState {
         bool emergencyMode;
         uint40 inactivityPeriod;
         uint40 lastProofOfLife;
         uint40 lastProofOfLifeBlock;
+        uint256 targetBlocks;
     }
 
     struct KeeperAuthorization {
@@ -206,11 +226,29 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     error ZeroShareAlreadySubmitted();
     error InvalidShareRefreshInput();
     error InvalidReshareDuration();
+    error InvalidVSSCommitmentUpdate();
+    error InvalidShareCommitment();
     error InvalidBLSKeyLength();
     error InvalidProofOfPossession();
     error GuardianBLSKeyNotRegistered();
     error ThresholdNotMetBLS();
     error DuplicateGuardianBLS();
+    error DelegationInvalidOrExpired();
+
+    bytes32 public constant GUARDIAN_DELEGATION_TYPEHASH = keccak256(
+        "GuardianDelegation(address guardian,address delegate,uint256 vaultId,uint256 validUntil,uint256 nonce)"
+    );
+
+    struct GuardianDelegation {
+        address guardian;
+        address delegate;
+        uint256 vaultId;
+        uint256 validUntil;
+        uint256 nonce;
+    }
+
+    // guardian => nonce => isRevoked
+    mapping(address => mapping(uint256 => bool)) public revokedNonces;
 
     struct GuardianBLSKeyInfo {
         bytes publicKey;
@@ -244,6 +282,10 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     mapping(uint256 => mapping(address => string)) public encryptedGuardianShares;
     // requestId => guardianAddress => encryptedShareForBeneficiary
     mapping(uint256 => mapping(address => string)) public beneficiaryKeyShares;
+    // documentId => guardianAddress => shareCommitment (keccak256 hash)
+    mapping(uint256 => mapping(address => bytes32)) public guardianShareCommitments;
+    // documentId => active Feldmann VSS polynomial coefficient commitments [C_0, C_1, ..., C_{k-1}]
+    mapping(uint256 => bytes32[]) public documentVssCommitments;
 
     // FHE-encrypted shares and accumulator mappings
     // documentId => guardianAddress => fheCiphertext
@@ -276,6 +318,25 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     // (via link_cross_chain_vault) need this enabled.
     mapping(uint256 => bool) public crossChainRevocationEnabled;
     mapping(uint256 => VaultReleaseState) private _vaultReleaseStates;
+
+    // ------------------------------------------------------------------
+    // Cumulative block-weighted time tracking (issue #86).
+    //
+    // A ring buffer of recent block timestamps lets us compute a median
+    // block interval that is resistant to single-block timestamp spoofing
+    // (miners may nudge block.timestamp by +/- 15s). That median interval
+    // converts the configured inactivity period into a target block count,
+    // so post-death unlock requires BOTH a real timestamp threshold AND a
+    // proportional number of blocks to have been mined.
+    // ------------------------------------------------------------------
+    uint256 public constant BLOCK_HISTORY_SIZE = 256;
+    uint256 private _blockHistoryHead;
+    uint256[BLOCK_HISTORY_SIZE] private _blockTimestamps;
+    uint256 private _blockHistoryCount;
+
+    /// @dev Default assumed block interval (seconds) used before the ring
+    /// buffer has accumulated enough samples to compute a median.
+    uint256 private constant DEFAULT_BLOCK_INTERVAL = 12;
     mapping(uint256 => address) private _vaultBeneficiary;
 
     // ------------------------------------------------------------------
@@ -384,6 +445,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     event KeyRevoked(address indexed user, string oldPublicKey, string newPublicKey, uint256 rotationCount);
     event GuardianSharesSaved(uint256 indexed documentId);
     event ShareSubmittedForBeneficiary(uint256 indexed requestId, address indexed guardian, string encryptedShare);
+    event ShareValidated(uint256 indexed requestId, address indexed guardian, bytes32 commitment);
     event FheGuardianSharesSaved(uint256 indexed documentId, uint256 count);
     event FheShareSubmitted(uint256 indexed requestId, address indexed guardian);
     event FheSharesAggregated(uint256 indexed requestId, uint256 indexed documentId, address indexed requester, bytes aggregateCiphertext);
@@ -547,7 +609,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             emergencyMode: false,
             inactivityPeriod: 30 days,
             lastProofOfLife: uint40(block.timestamp),
-            lastProofOfLifeBlock: uint40(block.number)
+            lastProofOfLifeBlock: uint40(block.number),
+            targetBlocks: 30 days / getMedianBlockInterval()
         });
 
         newVault.guardians.push(msg.sender);
@@ -705,7 +768,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         AccessLevel requiredAccess,
         address[] calldata guardiansList,
         string[] calldata shares
-    ) external returns (uint256) {
+    ) external nonReentrant returns (uint256) {
         return _addDocument(
             vaultId,
             encryptedMetadata,
@@ -742,6 +805,9 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
     /**
      * @dev Configure how long owner inactivity unlocks post-death mode.
+     *      Also computes the target block count from the inactivity period
+     *      and the current median block interval, so the block-delta gate
+     *      scales proportionally to the configured inactivity window.
      */
     function configureVaultRelease(uint256 vaultId, uint256 inactivityPeriod) external nonReentrant {
         if (vaults[vaultId].id == 0) revert VaultNotExist();
@@ -751,8 +817,15 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             revert InvalidInactivityPeriod();
         }
 
-        _vaultReleaseStates[vaultId].lastProofOfLife = uint40(block.timestamp);
-        _vaultReleaseStates[vaultId].inactivityPeriod = uint40(inactivityPeriod);
+        uint256 medianInterval = getMedianBlockInterval();
+        uint256 targetBlocks = inactivityPeriod / medianInterval;
+
+        VaultReleaseState storage state = _vaultReleaseStates[vaultId];
+        state.lastProofOfLife = uint40(block.timestamp);
+        state.lastProofOfLifeBlock = uint40(block.number);
+        state.inactivityPeriod = uint40(inactivityPeriod);
+        state.targetBlocks = targetBlocks;
+
         emit VaultReleaseConfigured(vaultId, inactivityPeriod);
     }
 
@@ -835,7 +908,94 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     function _recordProofOfLife(uint256 vaultId) internal {
         _vaultReleaseStates[vaultId].lastProofOfLife = uint40(block.timestamp);
         _vaultReleaseStates[vaultId].lastProofOfLifeBlock = uint40(block.number);
+        _recordBlockTimestamp();
         emit ProofOfLifeRecorded(vaultId, vaults[vaultId].creator, block.timestamp, getVaultGID(vaultId));
+    }
+
+    /**
+     * @dev Appends the current block.timestamp into the ring buffer used for
+     *      median block-interval estimation. Called on every proof-of-life so
+     *      the buffer samples real block progression over the vault's lifetime.
+     */
+    function _recordBlockTimestamp() internal {
+        _blockTimestamps[_blockHistoryHead] = block.timestamp;
+        _blockHistoryHead = (_blockHistoryHead + 1) % BLOCK_HISTORY_SIZE;
+        if (_blockHistoryCount < BLOCK_HISTORY_SIZE) {
+            _blockHistoryCount++;
+        }
+    }
+
+    /**
+     * @notice Returns the median block interval (seconds) derived from the
+     *         ring buffer of recent block timestamps. Resistant to single-block
+     *         timestamp spoofing because one manipulated sample is diluted by
+     *         the surrounding honest samples in the median.
+     * @return medianInterval The median interval in seconds (minimum 1).
+     */
+    function getMedianBlockInterval() public view returns (uint256 medianInterval) {
+        if (_blockHistoryCount < 2) {
+            return DEFAULT_BLOCK_INTERVAL;
+        }
+
+        // Copy timestamps into a memory array for sorting.
+        uint256[] memory timestamps = new uint256[](_blockHistoryCount);
+        uint256 start = (_blockHistoryHead + BLOCK_HISTORY_SIZE - _blockHistoryCount) % BLOCK_HISTORY_SIZE;
+        for (uint256 i = 0; i < _blockHistoryCount; i++) {
+            timestamps[i] = _blockTimestamps[(start + i) % BLOCK_HISTORY_SIZE];
+        }
+
+        // Insertion sort (buffer is small; O(n^2) is acceptable here).
+        for (uint256 i = 1; i < _blockHistoryCount; i++) {
+            uint256 key = timestamps[i];
+            uint256 j = i;
+            while (j > 0 && timestamps[j - 1] > key) {
+                timestamps[j] = timestamps[j - 1];
+                j--;
+            }
+            timestamps[j] = key;
+        }
+
+        // Compute consecutive intervals and median over those. Using the
+        // median of intervals (rather than the mean) discards outlier gaps
+        // caused by chain reorganizations or transient manipulation.
+        uint256 intervalCount = _blockHistoryCount - 1;
+        uint256[] memory intervals = new uint256[](intervalCount);
+        for (uint256 i = 1; i < _blockHistoryCount; i++) {
+            intervals[i - 1] = timestamps[i] - timestamps[i - 1];
+        }
+
+        for (uint256 i = 1; i < intervalCount; i++) {
+            uint256 key = intervals[i];
+            uint256 j = i;
+            while (j > 0 && intervals[j - 1] > key) {
+                intervals[j] = intervals[j - 1];
+                j--;
+            }
+            intervals[j] = key;
+        }
+
+        if (intervalCount % 2 == 0) {
+            uint256 a = intervals[(intervalCount / 2) - 1];
+            uint256 b = intervals[intervalCount / 2];
+            medianInterval = (a + b) / 2;
+        } else {
+            medianInterval = intervals[intervalCount / 2];
+        }
+
+        if (medianInterval == 0) {
+            medianInterval = 1;
+        }
+    }
+
+    /**
+     * @notice Returns the target block count required for post-death unlock
+     *         of `vaultId`, computed as inactivityPeriod / medianBlockInterval.
+     *         This scales the block-delta requirement proportionally to the
+     *         configured inactivity period instead of using a fixed constant.
+     */
+    function getTargetBlocks(uint256 vaultId) public view returns (uint256) {
+        if (vaults[vaultId].id == 0) revert VaultNotExist();
+        return _vaultReleaseStates[vaultId].targetBlocks;
     }
 
     /// @notice Returns the stable cross-chain identifier for an EVM vault.
@@ -907,7 +1067,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     }
 
     /// @notice Returns the beneficiary wallet address configured for `vaultId`, or the zero address if unset.
-    function getBeneficiary(uint256 vaultId) external view returns (address) {
+    function getBeneficiary(uint256 vaultId) external view nonReentrantView returns (address) {
         return _vaultBeneficiary[vaultId];
     }
 
@@ -1034,7 +1194,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Fetch vault release state summary.
      */
-    function getVaultReleaseState(uint256 vaultId) external view returns (
+    function getVaultReleaseState(uint256 vaultId) external view nonReentrantView returns (
         bool emergencyMode,
         uint256 inactivityPeriod,
         uint256 lastProofOfLife,
@@ -1267,6 +1427,27 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     }
 
     /**
+     * @dev Sets the initial Feldmann VSS polynomial commitments for a document.
+     * Callable by vault guardians or creator.
+     */
+    function setDocumentVSSCommitments(uint256 documentId, bytes32[] calldata commitments) external {
+        if (documents[documentId].id == 0) revert DocumentNotExist();
+        uint256 vaultId = documents[documentId].vaultId;
+        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
+        if (commitments.length < 2) revert InvalidVSSCommitmentUpdate();
+
+        documentVssCommitments[documentId] = commitments;
+        emit VSSCommitmentsUpdated(documentId, shareEpoch[documentId], commitments);
+    }
+
+    /**
+     * @dev Returns the current active Feldmann VSS polynomial coefficient commitments for a document.
+     */
+    function getDocumentVSSCommitments(uint256 documentId) external view returns (bytes32[] memory) {
+        return documentVssCommitments[documentId];
+    }
+
+    /**
      * @dev Finalizes the refresh once every current guardian has published a
      * zero-share commitment. Stores the redistributed (re-encrypted) shares
      * and irreversibly bumps the share epoch, invalidating all pre-refresh
@@ -1281,6 +1462,34 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         address[] calldata guardiansList,
         string[] calldata newShares
     ) external {
+        _applyShareRefresh(documentId, guardiansList, newShares, new bytes32[](0));
+    }
+
+    /**
+     * @dev Overload of applyShareRefresh that additionally updates the on-chain
+     * Feldmann VSS polynomial coefficient commitments to reflect the refreshed shares.
+     * Invariance check: Enforces newCommitments[0] == documentVssCommitments[documentId][0]
+     * so that the master key commitment remains unchanged.
+     * @param documentId The document whose shares are being refreshed.
+     * @param guardiansList Full guardian set of the vault.
+     * @param newShares Updated ECIES-encrypted shares, one per guardian.
+     * @param newCommitments Updated coefficient commitments [C'_0, C'_1, ..., C'_{k-1}].
+     */
+    function applyShareRefresh(
+        uint256 documentId,
+        address[] calldata guardiansList,
+        string[] calldata newShares,
+        bytes32[] calldata newCommitments
+    ) external {
+        _applyShareRefresh(documentId, guardiansList, newShares, newCommitments);
+    }
+
+    function _applyShareRefresh(
+        uint256 documentId,
+        address[] calldata guardiansList,
+        string[] calldata newShares,
+        bytes32[] memory newCommitments
+    ) internal {
         if (documents[documentId].id == 0) revert DocumentNotExist();
         ReshareSession storage session = reshareSessions[documentId];
         if (!session.active) revert ReshareSessionNotActive();
@@ -1305,6 +1514,9 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             }
 
             encryptedGuardianShares[documentId][guardian] = newShares[i];
+            if (bytes(newShares[i]).length > 0) {
+                guardianShareCommitments[documentId][guardian] = keccak256(bytes(newShares[i]));
+            }
         }
 
         if (session.submittedCount < vaultGuardians.length) {
@@ -1312,11 +1524,28 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             revert ReshareIncomplete();
         }
 
+        if (newCommitments.length > 0) {
+            bytes32[] storage currentComm = documentVssCommitments[documentId];
+            if (currentComm.length > 0) {
+                if (newCommitments.length != currentComm.length || newCommitments[0] != currentComm[0]) {
+                    revert InvalidVSSCommitmentUpdate();
+                }
+            } else {
+                if (newCommitments.length < 2) {
+                    revert InvalidVSSCommitmentUpdate();
+                }
+            }
+            documentVssCommitments[documentId] = newCommitments;
+        }
+
         session.active = false;
         uint256 newEpoch = shareEpoch[documentId] + 1;
         shareEpoch[documentId] = newEpoch;
 
         emit SharesRefreshed(documentId, newEpoch);
+        if (newCommitments.length > 0) {
+            emit VSSCommitmentsUpdated(documentId, newEpoch, newCommitments);
+        }
     }
 
     /**
@@ -1417,6 +1646,9 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
         for (uint256 i = 0; i < guardiansList.length; i++) {
             encryptedGuardianShares[documentId][guardiansList[i]] = shares[i];
+            if (bytes(shares[i]).length > 0) {
+                guardianShareCommitments[documentId][guardiansList[i]] = keccak256(bytes(shares[i]));
+            }
         }
 
         emit DocumentAdded(documentId, vaultId, ipfsHash);
@@ -1577,11 +1809,168 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         request.approvedBy.push(msg.sender);
 
         if (bytes(encryptedShareForBeneficiary).length > 0) {
+            bytes32 expectedCommitment = guardianShareCommitments[request.documentId][msg.sender];
+            if (expectedCommitment == bytes32(0) && bytes(encryptedGuardianShares[request.documentId][msg.sender]).length > 0) {
+                expectedCommitment = keccak256(bytes(encryptedGuardianShares[request.documentId][msg.sender]));
+            }
+            if (expectedCommitment != bytes32(0)) {
+                bytes32 submittedCommitment = keccak256(bytes(encryptedShareForBeneficiary));
+                if (submittedCommitment != expectedCommitment) {
+                    revert InvalidShareCommitment();
+                }
+                emit ShareValidated(requestId, msg.sender, submittedCommitment);
+            }
             beneficiaryKeyShares[requestId][msg.sender] = encryptedShareForBeneficiary;
             emit ShareSubmittedForBeneficiary(requestId, msg.sender, encryptedShareForBeneficiary);
         }
 
         emit AccessApproved(requestId, msg.sender);
+
+        if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
+            if (!_ownsVaultToken(request.requester, vaultId)) {
+                request.status = RequestStatus.REJECTED;
+                return;
+            }
+
+            request.status = RequestStatus.APPROVED;
+            _grantAccess(requestId, request.documentId, request.requester);
+        }
+    }
+
+    /**
+     * @notice Instantly revokes an off-chain EIP-712 delegation nonce for the caller.
+     * @param nonce The delegation nonce to invalidate.
+     */
+    function revokeDelegation(uint256 nonce) external {
+        revokedNonces[msg.sender][nonce] = true;
+        emit DelegationRevoked(msg.sender, nonce);
+    }
+
+    /**
+     * @notice Verifies an EIP-712 typed data guardian delegation signature.
+     * @param guardian The guardian address granting delegation.
+     * @param delegate The delegate authorized to act on behalf of the guardian.
+     * @param vaultId The vault for which delegation is valid.
+     * @param validUntil Expiration timestamp for the delegation.
+     * @param nonce Replay and revocation tracking nonce.
+     * @param signature 65-byte ECDSA signature over the EIP-712 typed struct hash.
+     * @return bool True if the signature is valid, unexpired, unrevoked, and guardian belongs to vault.
+     */
+    function verifyDelegation(
+        address guardian,
+        address delegate,
+        uint256 vaultId,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) public view returns (bool) {
+        if (block.timestamp > validUntil) return false;
+        if (revokedNonces[guardian][nonce]) return false;
+        if (!isGuardian[vaultId][guardian]) return false;
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                GUARDIAN_DELEGATION_TYPEHASH,
+                guardian,
+                delegate,
+                vaultId,
+                validUntil,
+                nonce
+            )
+        );
+        bytes32 digest = _hashTypedDataV4(structHash);
+        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError) {
+            return false;
+        }
+        return recovered == guardian;
+    }
+
+    /**
+     * @notice Approves a document access request on behalf of a guardian using a valid EIP-712 delegation.
+     * @param requestId Document access request ID.
+     * @param guardian The guardian who signed the delegation.
+     * @param validUntil Expiration timestamp for the delegation.
+     * @param nonce Replay and revocation tracking nonce.
+     * @param signature EIP-712 ECDSA signature by the guardian.
+     */
+    function approveAccessDelegated(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) external nonReentrant {
+        _approveAccessDelegated(requestId, guardian, validUntil, nonce, signature, "");
+    }
+
+    /**
+     * @notice Approves a document access request with beneficiary key share on behalf of a guardian using a valid EIP-712 delegation.
+     * @param requestId Document access request ID.
+     * @param guardian The guardian who signed the delegation.
+     * @param validUntil Expiration timestamp for the delegation.
+     * @param nonce Replay and revocation tracking nonce.
+     * @param signature EIP-712 ECDSA signature by the guardian.
+     * @param encryptedShareForBeneficiary Beneficiary key share encrypted with beneficiary public key.
+     */
+    function approveAccessDelegated(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature,
+        string calldata encryptedShareForBeneficiary
+    ) external nonReentrant {
+        _approveAccessDelegated(requestId, guardian, validUntil, nonce, signature, encryptedShareForBeneficiary);
+    }
+
+    function _approveAccessDelegated(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature,
+        string memory encryptedShareForBeneficiary
+    ) internal {
+        AccessRequest storage request = accessRequests[requestId];
+        if (request.requestId == 0) revert RequestNotExist();
+        if (request.status != RequestStatus.PENDING) revert RequestNotPending();
+        if (request.expiresAt <= block.timestamp) revert RequestExpired();
+        if (request.requester == guardian || request.requester == msg.sender) revert CannotSelfApproveAccess();
+
+        uint256 vaultId = documents[request.documentId].vaultId;
+        if (!verifyDelegation(guardian, msg.sender, vaultId, validUntil, nonce, signature)) {
+            revert DelegationInvalidOrExpired();
+        }
+
+        if (hasApprovedRequest[requestId][guardian]) revert AlreadyApproved();
+
+        bytes memory guardianKey = bytes(userPublicKeys[guardian]);
+        if (guardianKey.length != 0 && _revokedKeyHashes[keccak256(guardianKey)]) {
+            revert RevokedPublicKey();
+        }
+
+        hasApprovedRequest[requestId][guardian] = true;
+        request.approvedBy.push(guardian);
+
+        if (bytes(encryptedShareForBeneficiary).length > 0) {
+            bytes32 expectedCommitment = guardianShareCommitments[request.documentId][guardian];
+            if (expectedCommitment == bytes32(0) && bytes(encryptedGuardianShares[request.documentId][guardian]).length > 0) {
+                expectedCommitment = keccak256(bytes(encryptedGuardianShares[request.documentId][guardian]));
+            }
+            if (expectedCommitment != bytes32(0)) {
+                bytes32 submittedCommitment = keccak256(bytes(encryptedShareForBeneficiary));
+                if (submittedCommitment != expectedCommitment) {
+                    revert InvalidShareCommitment();
+                }
+                emit ShareValidated(requestId, guardian, submittedCommitment);
+            }
+            beneficiaryKeyShares[requestId][guardian] = encryptedShareForBeneficiary;
+            emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedShareForBeneficiary);
+        }
+
+        emit AccessApproved(requestId, guardian);
+        emit DelegatedApprovalSubmitted(requestId, guardian, msg.sender);
 
         if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
             if (!_ownsVaultToken(request.requester, vaultId)) {
@@ -1637,6 +2026,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     function _processBLSGuardians(
         uint256 requestId,
         uint256 vaultId,
+        uint256 documentId,
         address requester,
         address[] calldata guardianAddresses,
         string[] calldata encryptedSharesForBeneficiary
@@ -1650,6 +2040,17 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             if (!guardianBLSKeys[vaultId][guardian].registered) revert GuardianBLSKeyNotRegistered();
 
             if (i < encryptedSharesForBeneficiary.length && bytes(encryptedSharesForBeneficiary[i]).length > 0) {
+                bytes32 expectedCommitment = guardianShareCommitments[documentId][guardian];
+                if (expectedCommitment == bytes32(0) && bytes(encryptedGuardianShares[documentId][guardian]).length > 0) {
+                    expectedCommitment = keccak256(bytes(encryptedGuardianShares[documentId][guardian]));
+                }
+                if (expectedCommitment != bytes32(0)) {
+                    bytes32 submittedCommitment = keccak256(bytes(encryptedSharesForBeneficiary[i]));
+                    if (submittedCommitment != expectedCommitment) {
+                        revert InvalidShareCommitment();
+                    }
+                    emit ShareValidated(requestId, guardian, submittedCommitment);
+                }
                 beneficiaryKeyShares[requestId][guardian] = encryptedSharesForBeneficiary[i];
                 emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedSharesForBeneficiary[i]);
             }
@@ -1683,6 +2084,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         _processBLSGuardians(
             requestId,
             vaultId,
+            request.documentId,
             request.requester,
             guardianAddresses,
             encryptedSharesForBeneficiary
@@ -1805,7 +2207,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Get vault details.
      */
-    function getVault(uint256 vaultId) external view returns (
+    function getVault(uint256 vaultId) external view nonReentrantView returns (
         uint256 id,
         address creator,
         string memory name,
@@ -1831,7 +2233,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Get user's pending invites.
      */
-    function getPendingInvites(address user) external view returns (GuardianInvite[] memory) {
+    function getPendingInvites(address user) external view nonReentrantView returns (GuardianInvite[] memory) {
         uint256[] storage vaultIds = userInviteVaultIds[user];
         uint256 count = 0;
 
@@ -1859,21 +2261,21 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Return vault id attached to token id (0 if missing/deleted).
      */
-    function getTokenVault(uint256 tokenId) external view returns (uint256) {
+    function getTokenVault(uint256 tokenId) external view nonReentrantView returns (uint256) {
         return tokenVaultMapping[tokenId];
     }
 
     /**
      * @dev Returns whether user currently holds any token for vault.
      */
-    function hasVaultToken(address user, uint256 vaultId) external view returns (bool) {
+    function hasVaultToken(address user, uint256 vaultId) external view nonReentrantView returns (bool) {
         return _ownsVaultToken(user, vaultId);
     }
 
     /**
      * @dev Returns effective access, tied to both granted access and live vault token ownership.
      */
-    function hasActiveAccess(uint256 documentId, address user) external view returns (bool) {
+    function hasActiveAccess(uint256 documentId, address user) external view nonReentrantView returns (bool) {
         if (documents[documentId].id == 0) {
             return false;
         }
@@ -1886,7 +2288,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      *      third-party DApps can branch without catching reverts.
      * @return code 0 = document does not exist, 1 = access denied, 2 = access granted.
      */
-    function checkAccess(uint256 documentId, address user) external view returns (uint8) {
+    function checkAccess(uint256 documentId, address user) external view nonReentrantView returns (uint8) {
         if (documents[documentId].id == 0) {
             return 0; // DOCUMENT_NOT_FOUND
         }
@@ -1924,7 +2326,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Total active NFT supply (minted - burned).
      */
-    function totalSupply() external view returns (uint256) {
+    function totalSupply() external view nonReentrantView returns (uint256) {
         return _activeTokenSupply;
     }
 
@@ -2008,7 +2410,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         }
 
         bool timestampExpired = block.timestamp >= state.lastProofOfLife + state.inactivityPeriod;
-        bool blocksElapsed = block.number >= state.lastProofOfLifeBlock + MIN_POST_DEATH_BLOCK_DELTA;
+        bool blocksElapsed = block.number >= state.lastProofOfLifeBlock + state.targetBlocks;
 
         return timestampExpired && blocksElapsed;
     }
