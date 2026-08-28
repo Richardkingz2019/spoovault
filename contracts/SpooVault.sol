@@ -226,7 +226,6 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     error ZeroShareAlreadySubmitted();
     error InvalidShareRefreshInput();
     error InvalidReshareDuration();
-    error InvalidVSSCommitmentUpdate();
     error InvalidShareCommitment();
     error InvalidBLSKeyLength();
     error InvalidProofOfPossession();
@@ -284,8 +283,6 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     mapping(uint256 => mapping(address => string)) public beneficiaryKeyShares;
     // documentId => guardianAddress => shareCommitment (keccak256 hash)
     mapping(uint256 => mapping(address => bytes32)) public guardianShareCommitments;
-    // documentId => active Feldmann VSS polynomial coefficient commitments [C_0, C_1, ..., C_{k-1}]
-    mapping(uint256 => bytes32[]) public documentVssCommitments;
 
     // FHE-encrypted shares and accumulator mappings
     // documentId => guardianAddress => fheCiphertext
