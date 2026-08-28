@@ -134,9 +134,13 @@ contract ZKAccessVerifier {
         offset = _writeG2(pairings, offset, vkDelta[0][0], vkDelta[0][1], vkDelta[1][0], vkDelta[1][1]);
 
         // ── Execute pairing check ──────────────────────────────────────────
+        // The EIP-197 pairing precompile is only reachable through a low-level
+        // staticcall (there is no Solidity wrapper for it), and the 768-byte
+        // input is built from the packed 32-byte big-endian words above.
+        // slither-disable-next-line low-level-calls
         (bool success, bytes memory result) = PAIRING_PRECOMPILE.staticcall{
             gas: PAIRING_GAS
-        }(_packPairings(pairings));
+        }(abi.encodePacked(pairings));
 
         if (!success || result.length != 32 || !_b256ToBool(result)) {
             revert InvalidProof();
@@ -190,8 +194,10 @@ contract ZKAccessVerifier {
         offset = _writeG1(pairings, offset, c[0], c[1]);
         offset = _writeG2(pairings, offset, vkDelta[0][0], vkDelta[0][1], vkDelta[1][0], vkDelta[1][1]);
 
+        // EIP-197 pairing precompile — only callable via low-level staticcall.
+        // slither-disable-next-line low-level-calls
         (bool success, bytes memory result) = PAIRING_PRECOMPILE.staticcall(
-            _packPairings(pairings)
+            abi.encodePacked(pairings)
         );
         return success && result.length == 32 && _b256ToBool(result);
     }
@@ -212,46 +218,12 @@ contract ZKAccessVerifier {
         return uint8(data[31]) != 0;
     }
 
+    /// @dev `abi.encodePacked` on a `uint256[]` concatenates each element's
+    ///      32-byte big-endian encoding without a length prefix, producing
+    ///      exactly the contiguous EIP-197 pairing input expected by the
+    ///      precompile (768 bytes for four (G1, G2) pairs).
     function _packPairings(uint256[] memory pairings) internal pure returns (bytes memory) {
-        bytes memory packed = new bytes(pairings.length * 32);
-        for (uint256 i = 0; i < pairings.length; i++) {
-            uint256 value = pairings[i];
-            assembly {
-                mstore8(add(add(packed, 0x20), mul(i, 32)), byte(31, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 1)), byte(30, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 2)), byte(29, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 3)), byte(28, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 4)), byte(27, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 5)), byte(26, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 6)), byte(25, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 7)), byte(24, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 8)), byte(23, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 9)), byte(22, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 10)), byte(21, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 11)), byte(20, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 12)), byte(19, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 13)), byte(18, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 14)), byte(17, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 15)), byte(16, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 16)), byte(15, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 17)), byte(14, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 18)), byte(13, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 19)), byte(12, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 20)), byte(11, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 21)), byte(10, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 22)), byte(9, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 23)), byte(8, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 24)), byte(7, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 25)), byte(6, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 26)), byte(5, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 27)), byte(4, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 28)), byte(3, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 29)), byte(2, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 30)), byte(1, value))
-                mstore8(add(add(packed, 0x20), add(mul(i, 32), 31)), byte(0, value))
-            }
-        }
-        return packed;
+        return abi.encodePacked(pairings);
     }
 
     // ── Curve helpers ──────────────────────────────────────────────────────
@@ -265,6 +237,11 @@ contract ZKAccessVerifier {
         return lhs == rhs;
     }
 
+    // EIP-196 G1 addition precompile (0x06) is only reachable via a low-level
+    // staticcall (there is no Solidity wrapper for it), and the IC
+    // linear-combination loop in verifyProof/verifyProofView calls it at most
+    // inputs.length times — both are inherent to on-chain Groth16 verification.
+    // slither-disable-next-line calls-loop
     function _addG1(
         uint256[2] memory p1,
         uint256[2] memory p2
@@ -278,21 +255,23 @@ contract ZKAccessVerifier {
         input[2] = p2[0];
         input[3] = p2[1];
 
+        // slither-disable-next-line low-level-calls
         (bool success, bytes memory output) = address(0x06).staticcall(
             abi.encodePacked(input[0], input[1], input[2], input[3])
         );
-        if (!success) {
+        if (!success || output.length < 64) {
             r[0] = 0;
             r[1] = 0;
             return r;
         }
 
-        assembly {
-            mstore(r, mload(add(output, 32)))
-            mstore(add(r, 32), mload(add(output, 64)))
-        }
+        (r[0], r[1]) = abi.decode(output, (uint256, uint256));
     }
 
+    // EIP-196 G1 scalar-multiplication precompile (0x07) — same rationale as
+    // _addG1 above: only reachable via a low-level staticcall, invoked from the
+    // IC linear-combination loop at most inputs.length times.
+    // slither-disable-next-line calls-loop
     function _scalarMulG1(
         uint256[2] memory p,
         uint256 s
@@ -308,19 +287,17 @@ contract ZKAccessVerifier {
         input[1] = p[1];
         input[2] = s;
 
+        // slither-disable-next-line low-level-calls
         (bool success, bytes memory output) = address(0x07).staticcall(
             abi.encodePacked(input[0], input[1], input[2])
         );
-        if (!success) {
+        if (!success || output.length < 64) {
             r[0] = 0;
             r[1] = 0;
             return r;
         }
 
-        assembly {
-            mstore(r, mload(add(output, 32)))
-            mstore(add(r, 32), mload(add(output, 64)))
-        }
+        (r[0], r[1]) = abi.decode(output, (uint256, uint256));
     }
 
     // ── Encoding helpers ───────────────────────────────────────────────────

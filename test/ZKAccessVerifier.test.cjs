@@ -36,7 +36,11 @@ describe("ZKAccessVerifier (Groth16 Proof of Access)", function () {
   beforeEach(async function () {
     [submitter, other] = await ethers.getSigners();
 
-    const Factory = await ethers.getContractFactory("ZKAccessVerifier");
+    // Fully qualified name: main also carries a legacy stub artifact named
+    // ZKAccessVerifier under contracts/solidity/, so the bare name is ambiguous.
+    const Factory = await ethers.getContractFactory(
+      "contracts/ZKAccessVerifier.sol:ZKAccessVerifier"
+    );
     verifier = await Factory.deploy();
     await verifier.waitForDeployment();
   });
