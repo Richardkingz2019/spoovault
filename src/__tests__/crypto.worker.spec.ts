@@ -1,83 +1,62 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CryptoClientService } from '../services/crypto-client';
 
+// Vitest's Node "forks" project has no `window`/`Worker` globals, so the real
+// worker cannot be constructed. Stub a MockWorker that performs a genuine
+// structured-clone-with-transfer on every postMessage — exactly like a real
+// Worker — so ArrayBuffer transfers really detach instead of merely being
+// asserted about. (Same pattern as cryptoWorker.pool.test.ts.)
+
 class MockWorker {
-  onmessage: ((event: any) => void) | null = null;
-  onerror: ((event: any) => void) | null = null;
-  postMessage(_message: any, transfer?: Transferable[]) {
-    if (transfer?.length) {
-      structuredClone(_message, { transfer });
-    }
-    setTimeout(() => {
-      if (this.onmessage) {
-        this.onmessage({ data: { status: 'SUCCESS', hash: new ArrayBuffer(32) } });
-      }
-    }, 0);
+  static instances: MockWorker[] = [];
+
+  onmessage:
+    | ((event: MessageEvent<{ status: string; hash: ArrayBuffer }>) => void)
+    | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  terminated = false;
+
+  constructor(_url?: unknown, _opts?: unknown) {
+    MockWorker.instances.push(this);
   }
-  terminate() {}
+
+  postMessage(message: { type: string; buffer: ArrayBuffer }, transfer?: Transferable[]) {
+    // Genuinely transfers (detaches) any ArrayBuffers in `transfer`, mirroring
+    // a real Worker's postMessage(data, [data.buffer]) semantics, so the
+    // caller's buffer is actually neutered rather than just copied.
+    structuredClone(message, { transfer });
+
+    queueMicrotask(() => {
+      this.onmessage?.({
+        data: { status: 'SUCCESS', hash: new ArrayBuffer(0) },
+      } as MessageEvent<{ status: string; hash: ArrayBuffer }>);
+    });
+  }
+
+  terminate() {
+    this.terminated = true;
+  }
 }
 
-if (typeof globalThis.Worker === 'undefined') {
-  (globalThis as any).Worker = MockWorker;
-}
+afterEach(() => {
+  vi.unstubAllGlobals();
+  MockWorker.instances = [];
+});
 
 describe('CryptoWorker Zero-Copy Transfer (#42)', () => {
-  const originalWorker = globalThis.Worker;
+  it('detaches ArrayBuffer ownership upon postMessage invocation', () => {
+    vi.stubGlobal('Worker', MockWorker);
 
-  beforeAll(() => {
-    if (typeof globalThis.Worker === 'undefined') {
-      globalThis.Worker = class MockWorker {
-        onmessage: ((e: any) => void) | null = null;
-        onerror: ((e: any) => void) | null = null;
-
-        postMessage(_msg: any, transfer?: Transferable[]) {
-          if (transfer) {
-            for (const item of transfer) {
-              if (item instanceof ArrayBuffer) {
-                try {
-                  (item as any).transfer?.();
-                } catch {
-                  Object.defineProperty(item, 'byteLength', { value: 0, configurable: true });
-                }
-              }
-            }
-          }
-          queueMicrotask(() => {
-            if (this.onmessage) {
-              this.onmessage({ data: { status: 'success', hash: new ArrayBuffer(32) } });
-            }
-          });
-        }
-
-        terminate() {
-          if (this.onerror) {
-            this.onerror(new Error('Worker terminated'));
-          }
-        }
-      } as any;
-    }
-  });
-
-  afterAll(() => {
-    globalThis.Worker = originalWorker;
-  });
-
-  it('detaches ArrayBuffer ownership upon postMessage invocation', async () => {
     const client = new CryptoClientService();
     const buffer = new ArrayBuffer(1024 * 1024); // 1 MB payload
 
     expect(buffer.byteLength).toBe(1024 * 1024);
 
-    const promise = client.computeHash(buffer);
+    client.computeHash(buffer);
 
     // Verify zero-copy detachment: sender side buffer byteLength becomes 0 after transfer
     expect(buffer.byteLength).toBe(0);
 
     client.terminate();
-    try {
-      await promise;
-    } catch {
-      // Ignored on terminated worker
-    }
   });
 });
