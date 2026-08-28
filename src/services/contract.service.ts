@@ -89,6 +89,13 @@ export interface VaultReleaseState {
   postDeathUnlocked: boolean;
 }
 
+export interface EmergencyUnlockSchedule {
+  requested: boolean;
+  fulfilled: boolean;
+  unlockAt: number;
+  unlockBlock: number;
+}
+
 export interface KeeperAuthorizationData {
   keeper: string;
   expiresAt: number;
@@ -109,6 +116,8 @@ const CONTRACT_ABI = [
   "function keeperAuthNonces(uint256 vaultId) external view returns (uint256)",
   "function getVaultGID(uint256 vaultId) external view returns (string)",
   "function setEmergencyMode(uint256 vaultId, bool enabled) external",
+  "function getEmergencyUnlockSchedule(uint256 vaultId) external view returns (bool requested, bool fulfilled, uint256 unlockAt, uint256 unlockBlock)",
+  "function getVrfConfig() external view returns (address coordinator, bytes32 keyHash, uint256 subscriptionId, uint32 callbackGasLimit, uint16 minimumRequestConfirmations)",
   "function setBeneficiary(uint256 vaultId, address beneficiary) external",
   "function getBeneficiary(uint256 vaultId) external view returns (address)",
   "function getVaultReleaseState(uint256 vaultId) external view returns (bool emergencyMode, uint256 inactivityPeriod, uint256 lastProofOfLife, bool postDeathUnlocked)",
@@ -1324,6 +1333,9 @@ const getDocumentReleaseConditionMap = async (
 };
 
 const getVaultReleaseState = async (vaultId: number): Promise<VaultReleaseState> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.getReleaseState(vaultId);
+  }
   await ensureContractDeployed();
   const contract = ensureReadContract();
 
@@ -1365,6 +1377,42 @@ const fetchVaultReleaseStates = async (
   return Object.fromEntries(entries);
 };
 
+const fetchEmergencyUnlockSchedules = async (
+  vaultIds: number[]
+): Promise<Record<number, EmergencyUnlockSchedule>> => {
+  if (vaultIds.length === 0) {
+    return {};
+  }
+
+  if (getEcosystem() === "stellar") {
+    const entries = await Promise.all(
+      vaultIds.map(async (vaultId) => {
+        let schedule = await stellarService.getEmergencyUnlockSchedule(vaultId);
+        if (
+          !stellarService.isConfigured() &&
+          schedule.requested &&
+          !schedule.fulfilled
+        ) {
+          try {
+            await stellarService.fulfillEmergencyUnlockDelay(vaultId);
+            schedule = await stellarService.getEmergencyUnlockSchedule(vaultId);
+          } catch {
+            // Mock confirmation window has not elapsed yet.
+          }
+        }
+        return [vaultId, schedule] as const;
+      })
+    );
+    return Object.fromEntries(entries);
+  }
+
+  const entries = await Promise.all(
+    vaultIds.map(async (vaultId) => [vaultId, await getEmergencyUnlockSchedule(vaultId)] as const)
+  );
+
+  return Object.fromEntries(entries);
+};
+
 const configureVaultRelease = async (
   vaultId: number,
   inactivityPeriod: number
@@ -1398,13 +1446,55 @@ const getVaultGID = async (vaultId: number): Promise<string> => {
   return String(await readContract.getVaultGID(vaultId));
 };
 
+const getEmergencyUnlockSchedule = async (
+  vaultId: number
+): Promise<EmergencyUnlockSchedule> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.getEmergencyUnlockSchedule(vaultId);
+  }
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  const empty: EmergencyUnlockSchedule = {
+    requested: false,
+    fulfilled: false,
+    unlockAt: 0,
+    unlockBlock: 0,
+  };
+
+  if (!contractHasFunction(contract, "getEmergencyUnlockSchedule(uint256)")) {
+    return empty;
+  }
+
+  try {
+    const value = await contract.getEmergencyUnlockSchedule(vaultId);
+    return {
+      requested: Boolean(value[0]),
+      fulfilled: Boolean(value[1]),
+      unlockAt: Number(value[2]),
+      unlockBlock: Number(value[3]),
+    };
+  } catch {
+    return empty;
+  }
+};
+
 const setEmergencyMode = async (vaultId: number, enabled: boolean): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    await stellarService.setEmergencyMode(vaultId, enabled);
+    return;
+  }
   const contract = ensureWriteContract();
   if (!contractHasFunction(contract, "setEmergencyMode(uint256,bool)")) {
     throw new Error("Current contract does not support emergency mode controls.");
   }
   const tx = await contract.setEmergencyMode(vaultId, enabled);
   await waitForReceipt(tx);
+};
+
+const fulfillEmergencyUnlockDelay = async (vaultId: number): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    await stellarService.fulfillEmergencyUnlockDelay(vaultId);
+  }
 };
 
 const setBeneficiary = async (vaultId: number, beneficiary: string): Promise<void> => {
@@ -2388,10 +2478,13 @@ export const contractService = {
   getDocumentReleaseConditionMap,
   getVaultReleaseState,
   fetchVaultReleaseStates,
+  fetchEmergencyUnlockSchedules,
   configureVaultRelease,
   recordProofOfLife,
   getVaultGID,
   setEmergencyMode,
+  fulfillEmergencyUnlockDelay,
+  getEmergencyUnlockSchedule,
   setBeneficiary,
   getBeneficiary,
   signKeeperAuthorization,
