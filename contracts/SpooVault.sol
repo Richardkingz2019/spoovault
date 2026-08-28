@@ -414,6 +414,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuardTransient, EIP712 {
     mapping(uint256 => mapping(uint256 => mapping(address => bytes32[]))) public zeroShareCommitments;
     // documentId => epoch => guardian => whether the zero-share was submitted
     mapping(uint256 => mapping(uint256 => mapping(address => bool))) private _zeroShareSubmitted;
+    // documentId => active Feldmann VSS polynomial coefficient commitments [C_0, C_1, ..., C_{k-1}]
+    mapping(uint256 => bytes32[]) public documentVssCommitments;
 
     event VaultCreated(uint256 indexed vaultId, address indexed creator, string name);
     event GuardianAdded(uint256 indexed vaultId, address indexed guardian);
