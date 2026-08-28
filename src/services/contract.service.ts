@@ -116,6 +116,11 @@ const CONTRACT_ABI = [
   "function requestAccess(uint256 documentId) external returns (uint256)",
   "function approveAccess(uint256 requestId) external",
   "function approveAccess(uint256 requestId, string encryptedShareForBeneficiary) external",
+  "function verifyDelegation(address guardian, address delegate, uint256 vaultId, uint256 validUntil, uint256 nonce, bytes signature) external view returns (bool)",
+  "function revokeDelegation(uint256 nonce) external",
+  "function approveAccessDelegated(uint256 requestId, address guardian, uint256 validUntil, uint256 nonce, bytes signature) external",
+  "function approveAccessDelegated(uint256 requestId, address guardian, uint256 validUntil, uint256 nonce, bytes signature, string encryptedShareForBeneficiary) external",
+  "function revokedNonces(address guardian, uint256 nonce) external view returns (bool)",
   "function guardianShareCommitments(uint256 documentId, address guardian) external view returns (bytes32)",
   "function setDocumentVSSCommitments(uint256 documentId, bytes32[] commitments) external",
   "function getDocumentVSSCommitments(uint256 documentId) external view returns (bytes32[])",
@@ -160,6 +165,8 @@ const CONTRACT_ABI = [
   "event KeeperAuthorized(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 expiresAt)",
   "event KeeperRevoked(uint256 indexed vaultId, address indexed owner)",
   "event ProofOfLifeRelayed(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 timestamp)",
+  "event DelegationRevoked(address indexed guardian, uint256 indexed nonce)",
+  "event DelegatedApprovalSubmitted(uint256 indexed requestId, address indexed guardian, address indexed delegate)",
 ];
 
 const KEEPER_AUTHORIZATION_EIP712_TYPES = {
@@ -167,6 +174,16 @@ const KEEPER_AUTHORIZATION_EIP712_TYPES = {
     { name: "vaultId", type: "uint256" },
     { name: "keeper", type: "address" },
     { name: "expiresAt", type: "uint256" },
+    { name: "nonce", type: "uint256" },
+  ],
+};
+
+const GUARDIAN_DELEGATION_EIP712_TYPES = {
+  GuardianDelegation: [
+    { name: "guardian", type: "address" },
+    { name: "delegate", type: "address" },
+    { name: "vaultId", type: "uint256" },
+    { name: "validUntil", type: "uint256" },
     { name: "nonce", type: "uint256" },
   ],
 };
@@ -1506,6 +1523,97 @@ const getKeeperAuthorization = async (vaultId: number): Promise<KeeperAuthorizat
   }
 };
 
+const signGuardianDelegation = async (
+  guardian: string,
+  delegate: string,
+  vaultId: number,
+  validUntil: number,
+  nonce: number
+): Promise<string> => {
+  const contract = ensureWriteContract();
+  const signer = contract.runner;
+  if (!signer || typeof (signer as ethers.Signer).signTypedData !== "function") {
+    throw new Error("A connected wallet signer is required to sign a guardian delegation.");
+  }
+
+  const domain = {
+    name: "SpooVault",
+    version: "1",
+    chainId: getConfiguredChainId(),
+    verifyingContract: getContractAddress(),
+  };
+
+  return (signer as ethers.Signer).signTypedData(domain, GUARDIAN_DELEGATION_EIP712_TYPES, {
+    guardian,
+    delegate,
+    vaultId,
+    validUntil,
+    nonce,
+  });
+};
+
+const approveAccessDelegated = async (
+  requestId: number,
+  guardian: string,
+  validUntil: number,
+  nonce: number,
+  signature: string,
+  encryptedShareForBeneficiary = ""
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  const withShare =
+    "approveAccessDelegated(uint256,address,uint256,uint256,bytes,string)";
+  const withoutShare =
+    "approveAccessDelegated(uint256,address,uint256,uint256,bytes)";
+  if (!contractHasFunction(contract, withShare) && !contractHasFunction(contract, withoutShare)) {
+    throw new Error("Current contract does not support guardian approval delegation.");
+  }
+  const tx =
+    encryptedShareForBeneficiary && contractHasFunction(contract, withShare)
+      ? await contract["approveAccessDelegated(uint256,address,uint256,uint256,bytes,string)"](
+          requestId,
+          guardian,
+          validUntil,
+          nonce,
+          signature,
+          encryptedShareForBeneficiary
+        )
+      : await contract["approveAccessDelegated(uint256,address,uint256,uint256,bytes)"](
+          requestId,
+          guardian,
+          validUntil,
+          nonce,
+          signature
+        );
+  await waitForReceipt(tx);
+  clearAccessCache();
+};
+
+/** @deprecated Use approveAccessDelegated */
+const approveAccessByDelegation = approveAccessDelegated;
+
+const revokeDelegation = async (nonce: number): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "revokeDelegation(uint256)")) {
+    throw new Error("Current contract does not support guardian approval delegation.");
+  }
+  const tx = await contract.revokeDelegation(nonce);
+  await waitForReceipt(tx);
+};
+
+const isDelegationNonceRevoked = async (guardian: string, nonce: number): Promise<boolean> => {
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  if (!contractHasFunction(contract, "revokedNonces(address,uint256)")) {
+    return false;
+  }
+  try {
+    return Boolean(await contract.revokedNonces(guardian, nonce));
+  } catch {
+    return false;
+  }
+};
+
 const fetchPendingInvites = async (user: string): Promise<GuardianInviteData[]> => {
   if (!user) {
     return [];
@@ -2291,6 +2399,11 @@ export const contractService = {
   revokeKeeper,
   relayProofOfLife,
   getKeeperAuthorization,
+  signGuardianDelegation,
+  approveAccessDelegated,
+  approveAccessByDelegation,
+  revokeDelegation,
+  isDelegationNonceRevoked,
   fetchPendingApprovalsForGuardian: proxiedFetchPendingApprovalsForGuardian,
   getRecentActivity,
   registerPublicKey: proxiedRegisterPublicKey,
