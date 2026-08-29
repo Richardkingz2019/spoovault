@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "../../contracts/SpooVault.sol";
+import "./SpooVaultFuzzBytecode.sol";
 
 /**
  * @title FuzzGuardian
@@ -76,7 +77,9 @@ contract SpooVaultFuzz {
     uint256 private trackedSupply;
 
     constructor() {
-        vault = new SpooVault();
+        address vrfLib = SpooVaultFuzzBytecode.deployEmergencyVrfLogic();
+        address adminLib = SpooVaultFuzzBytecode.deploySpooVaultAdminLogic();
+        vault = SpooVault(payable(SpooVaultFuzzBytecode.deployLinkedVault(vrfLib, adminLib)));
         guardian2 = new FuzzGuardian(vault);
 
         // `address(this)` becomes the vault's first guardian automatically

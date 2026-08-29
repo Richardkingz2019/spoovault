@@ -53,6 +53,11 @@ jobs:
             echo "path=/src/fuzz/echidna/config.yaml" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Generate linked fuzz bytecode
+        run: |
+          npx hardhat compile
+          node scripts/generate-echidna-fuzz-bytecode.mjs
+
       - name: Run Echidna campaign
         run: |
           docker run --rm \
@@ -115,6 +120,11 @@ jobs:
             echo "file=medusa.json" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Generate linked fuzz bytecode
+        run: |
+          npx hardhat compile
+          node scripts/generate-echidna-fuzz-bytecode.mjs
+
       - name: Run Medusa campaign
         run: |
           export PATH="$HOME/go/bin:$PATH"
@@ -166,7 +176,7 @@ jobs:
       # (256 generated sequences per run; see docs/TESTING.md).
       - name: Run Soroban contract test suite
         working-directory: contracts-stellar
-        run: cargo +stable test
+        run: cargo +stable test --features upgrade-tests
 
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
