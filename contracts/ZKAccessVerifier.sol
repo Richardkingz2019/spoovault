@@ -218,14 +218,6 @@ contract ZKAccessVerifier {
         return uint8(data[31]) != 0;
     }
 
-    /// @dev `abi.encodePacked` on a `uint256[]` concatenates each element's
-    ///      32-byte big-endian encoding without a length prefix, producing
-    ///      exactly the contiguous EIP-197 pairing input expected by the
-    ///      precompile (768 bytes for four (G1, G2) pairs).
-    function _packPairings(uint256[] memory pairings) internal pure returns (bytes memory) {
-        return abi.encodePacked(pairings);
-    }
-
     // ── Curve helpers ──────────────────────────────────────────────────────
 
     function _isOnG1(uint256 x, uint256 y) internal pure returns (bool) {
