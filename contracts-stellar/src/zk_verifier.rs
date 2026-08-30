@@ -205,9 +205,9 @@ impl Fp {
     fn add(&self, other: &Fp) -> Fp {
         let mut out = [0u64; 4];
         let mut carry = 0u128;
-        for i in 0..4 {
-            let sum = self.0[i] as u128 + other.0[i] as u128 + carry;
-            out[i] = sum as u64;
+        for (o, (a, b)) in out.iter_mut().zip(self.0.iter().zip(other.0.iter())) {
+            let sum = *a as u128 + *b as u128 + carry;
+            *o = sum as u64;
             carry = sum >> 64;
         }
         let mut r = Fp(out);
@@ -221,13 +221,13 @@ impl Fp {
     fn sub_raw(&self, other: &Fp) -> Fp {
         let mut out = [0u64; 4];
         let mut borrow = 0i128;
-        for i in 0..4 {
-            let diff = self.0[i] as i128 - other.0[i] as i128 - borrow;
+        for (o, (a, b)) in out.iter_mut().zip(self.0.iter().zip(other.0.iter())) {
+            let diff = *a as i128 - *b as i128 - borrow;
             if diff < 0 {
-                out[i] = (diff + (1i128 << 64)) as u64;
+                *o = (diff + (1i128 << 64)) as u64;
                 borrow = 1;
             } else {
-                out[i] = diff as u64;
+                *o = diff as u64;
                 borrow = 0;
             }
         }
@@ -303,8 +303,8 @@ impl Fp {
     fn inv(&self) -> Fp {
         let mut result = Fp::ONE;
         let mut base_pow = *self;
-        for i in 0..4 {
-            let mut limb = P_MINUS_2_LIMBS[i];
+        for limb in P_MINUS_2_LIMBS {
+            let mut limb = limb;
             for _ in 0..64 {
                 if limb & 1 == 1 {
                     result = result.mul(&base_pow);
@@ -335,7 +335,7 @@ impl Fp {
     }
 
     /// To a 32-byte big-endian integer (from Montgomery form).
-    fn to_be_bytes(&self) -> [u8; 32] {
+    fn to_be_bytes(self) -> [u8; 32] {
         // Multiply by the *raw* 1 (not the Montgomery encoding of 1) to exit
         // Montgomery form: (x·R)·1·R⁻¹ = x.
         let norm = self.mul(&Fp([1, 0, 0, 0]));
@@ -495,8 +495,8 @@ impl Fq12 {
 
     fn add(&self, other: &Fq12) -> Fq12 {
         let mut out = [Fq2::zero(); 6];
-        for i in 0..6 {
-            out[i] = self.0[i].add(&other.0[i]);
+        for (o, (a, b)) in out.iter_mut().zip(self.0.iter().zip(other.0.iter())) {
+            *o = a.add(b);
         }
         Fq12(out)
     }
@@ -638,7 +638,7 @@ impl G1Affine {
         Ok(pt)
     }
 
-    fn to_bytes(&self) -> [u8; 64] {
+    fn to_bytes(self) -> [u8; 64] {
         let mut out = [0u8; 64];
         if self.infinity {
             return out;
@@ -757,7 +757,7 @@ impl G2Affine {
         Ok(pt)
     }
 
-    fn to_bytes(&self) -> [u8; 128] {
+    fn to_bytes(self) -> [u8; 128] {
         let mut out = [0u8; 128];
         if self.infinity {
             return out;
@@ -1019,7 +1019,6 @@ fn to_storage_bytes(env: &Env, key: &ZkVerifierDataKey) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
 
     // Known BN254 generator points (EIP-197).
     fn g1_gen() -> G1Affine {
